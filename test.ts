@@ -14,13 +14,21 @@ import {
   dateTime,
   formatLinearLabel,
   healthLabel,
+  labelSelectNames,
   latestTimestamp,
   linkedResourcesFromProject,
   longFormContent,
+  milestoneSummary,
   personDisplay,
+  personEmail,
+  pickCurrentRelease,
   priorityLabel,
   projectStatusLabel,
+  relatedInitiativeIds,
+  releaseDisplayName,
   resourcePageContent,
+  selectName,
+  teamSelectName,
   teamSelectNames,
   workflowCategoryLabel,
 } from "./src/helpers.js"
@@ -29,9 +37,13 @@ import { initiativeToChange } from "./src/initiatives.js"
 import { issueToChange, issueToSyncChange } from "./src/issues.js"
 import {
   MAX_NESTED_INITIATIVE_PROJECT_REQUESTS_PER_PAGE,
+  MAX_NESTED_MILESTONE_REQUESTS_PER_PAGE,
+  MAX_NESTED_RELEASE_ISSUE_REQUESTS_PER_PAGE,
   fetchInitiativesPage,
+  fetchIssuesByIds,
   fetchIssuesPage,
   fetchProjectsPage,
+  fetchReleasesPage,
   parseRetryAfterSeconds,
   rateLimitRetryAfterSeconds,
 } from "./src/linear.js"
@@ -40,15 +52,28 @@ import type {
   LinearInitiativeProject,
   LinearIssue,
   LinearProject,
+  LinearRelease,
+  LinearReleaseRef,
 } from "./src/linear.js"
-import { projectToChange } from "./src/projects.js"
+import {
+  ISSUE_STATUS_OPTIONS,
+  PROJECT_LABEL_OPTIONS,
+  PROJECT_STATUS_OPTIONS,
+  RELEASE_STAGE_OPTIONS,
+  TEAM_OPTIONS,
+  WORKFLOW_CATEGORY_OPTIONS,
+} from "./src/options.js"
+import { projectToChange, projectToSyncChange } from "./src/projects.js"
 import {
   CONSISTENCY_BUFFER_MS,
-  INITIAL_ISSUE_WATERMARK,
+  INITIAL_WATERMARK,
+  MAX_CYCLE_PAGES,
+  RELEASE_SYNC_LOOKBACK_MS,
+  RETAINED_CURSORS,
   WATERMARK_OVERLAP_MS,
-  issueIncrementalWindow,
+  incrementalWindow,
   nextCursorState,
-  nextIssueWatermark,
+  nextWatermark,
 } from "./src/sync-state.js"
 
 const originalFetch = globalThis.fetch
@@ -76,6 +101,55 @@ function assertPropertyContains(value: unknown, expected: string): void {
   )
 }
 
+/**
+ * Builder.select("A") serializes to [["A"]] and Builder.multiSelect("A", "B")
+ * to [["A,B"]] — which is exactly why option names cannot contain commas.
+ */
+function selectValues(property: unknown): string[] {
+  const raw = (property as unknown[][] | undefined)?.[0]?.[0]
+  if (typeof raw !== "string") return []
+  return raw
+    .split(",")
+    .map((value) => value.trim())
+    .filter((value) => value.length > 0)
+}
+
+/**
+ * A select value the schema does not declare is dropped on write with no
+ * error, so the only way to see it is to check the transform against the
+ * schema it writes into.
+ */
+function assertSelectValuesAreDeclared(
+  databaseKey: string,
+  properties: Record<string, unknown>
+): void {
+  const schema =
+    worker.manifest.databases.find((database) => database.key === databaseKey)
+      ?.config.schema.properties ?? {}
+
+  for (const [name, value] of Object.entries(properties)) {
+    const declaration = schema[name] as
+      | { type: string; options?: { name: string }[] }
+      | undefined
+    if (
+      declaration?.type !== "select" &&
+      declaration?.type !== "multi_select"
+    ) {
+      continue
+    }
+
+    const declared = new Set(
+      (declaration.options ?? []).map((option) => option.name)
+    )
+    for (const emitted of selectValues(value)) {
+      assert.ok(
+        declared.has(emitted),
+        `${databaseKey}.${name} emits "${emitted}", which src/options.ts does not declare`
+      )
+    }
+  }
+}
+
 function emptyConnection<T>(): {
   nodes: T[]
   pageInfo: { hasNextPage: boolean; endCursor: null }
@@ -95,14 +169,40 @@ const fullProject: LinearProject = {
     createdAt: "2026-07-01T15:16:17.654Z",
     updatedAt: "2026-07-01T16:17:18.654Z",
     url: "https://linear.app/acme/project/launch-enterprise-42/updates/last",
-    user: { name: "Ada Lovelace", displayName: "Ada" },
+    user: { name: "Ada Lovelace", displayName: "Ada", email: "ada@example.com" },
   },
-  lead: { name: "Ada Lovelace", displayName: "Ada" },
+  lead: { name: "Ada Lovelace", displayName: "Ada", email: "ada@example.com" },
   teams: {
     nodes: [
       { name: "Platform", key: "PLT" },
       { name: "Product, Core", key: "PD" },
       { name: "Platform", key: "PLT" },
+    ],
+    pageInfo: { hasNextPage: false, endCursor: null },
+  },
+  labels: {
+    nodes: [{ name: "sdlc" }, { name: "platform,core" }, { name: "sdlc" }],
+    pageInfo: { hasNextPage: false, endCursor: null },
+  },
+  projectMilestones: {
+    nodes: [
+      { name: "Beta", targetDate: "2026-06-01" },
+      { name: "GA", targetDate: null },
+    ],
+    pageInfo: { hasNextPage: false, endCursor: null },
+  },
+  initiatives: {
+    nodes: [
+      {
+        id: "33ac57a9-f846-44e8-9889-91f061409343",
+        name: "Enterprise readiness",
+        archivedAt: null,
+      },
+      {
+        id: "archived-initiative",
+        name: "Old initiative",
+        archivedAt: "2026-01-01T00:00:00Z",
+      },
     ],
     pageInfo: { hasNextPage: false, endCursor: null },
   },
@@ -143,6 +243,9 @@ const minimalProject: LinearProject = {
   lastUpdate: null,
   lead: null,
   teams: emptyConnection(),
+  labels: emptyConnection(),
+  projectMilestones: emptyConnection(),
+  initiatives: emptyConnection(),
   externalLinks: emptyConnection(),
   documents: emptyConnection(),
   priority: null,
@@ -170,12 +273,37 @@ const fullIssue: LinearIssue = {
   state: { name: "In Progress", type: "started" },
   priority: 1,
   priorityLabel: "",
-  assignee: { name: "Grace Hopper", displayName: "Grace" },
+  assignee: { name: "Grace Hopper", displayName: "Grace", email: "grace@example.com" },
   team: { name: "Engineering", key: "ENG" },
-  project: { name: "Launch Enterprise" },
+  project: {
+    id: "0c0d1a3c-2f2f-4c6f-9b8a-1f3b6f5a2d10",
+    name: "Launch Enterprise",
+  },
   cycle: { name: "Cycle 27", number: 27 },
   labels: {
-    nodes: [{ name: "backend" }, { name: "api" }, { name: "backend" }],
+    // A comma and a double space, which the schema options do not contain.
+    nodes: [
+      { name: "backend" },
+      { name: "api, internal" },
+      { name: "needs  review" },
+      { name: "backend" },
+    ],
+    pageInfo: { hasNextPage: false, endCursor: null },
+  },
+  releases: {
+    nodes: [
+      {
+        id: "rel-ios-1048",
+        name: "10.4.8",
+        version: "10.4.8",
+        completedAt: null,
+        updatedAt: "2026-06-30T21:00:00.000Z",
+        archivedAt: null,
+        trashed: false,
+        stage: { name: "Planned", type: "planned" },
+        pipeline: { name: "iOS Clinician" },
+      },
+    ],
     pageInfo: { hasNextPage: false, endCursor: null },
   },
   estimate: 0,
@@ -206,6 +334,10 @@ const minimalIssue: LinearIssue = {
     nodes: [],
     pageInfo: { hasNextPage: false, endCursor: null },
   },
+  releases: {
+    nodes: [],
+    pageInfo: { hasNextPage: false, endCursor: null },
+  },
   estimate: null,
   dueDate: null,
   createdAt: "2026-01-01T00:00:00Z",
@@ -229,9 +361,13 @@ const fullInitiative: LinearInitiative = {
     createdAt: "2026-07-02T17:18:19.321Z",
     updatedAt: "2026-07-02T18:19:20.321Z",
     url: "https://linear.app/acme/initiative/enterprise-readiness-2026/updates/last",
-    user: { name: "Nan Yu", displayName: "Nan" },
+    user: { name: "Nan Yu", displayName: "Nan", email: "nan@example.com" },
   },
-  owner: { name: "Katherine Johnson", displayName: "Katherine" },
+  owner: {
+    name: "Katherine Johnson",
+    displayName: "Katherine",
+    email: "katherine@example.com",
+  },
   projects: {
     nodes: [
       {
@@ -305,7 +441,8 @@ const minimalInitiative: LinearInitiative = {
 }
 
 test("worker manifest preserves databases, sync schedules, and shared pacing", () => {
-  // v1: issues stay in source but are not registered until ENABLE_ISSUES.
+  // Issues are declared after projects because the issue Project property is a
+  // relation into the projects database.
   assert.deepEqual(
     worker.manifest.databases.map((database) => ({
       key: database.key,
@@ -315,16 +452,22 @@ test("worker manifest preserves databases, sync schedules, and shared pacing", (
     })),
     [
       {
+        key: "initiatives",
+        title: "Linear Initiatives",
+        primaryKey: "Linear Initiative ID",
+        icon: { type: "notion", icon: "trophy", color: "gray" },
+      },
+      {
         key: "projects",
         title: "Linear Projects",
         primaryKey: "Linear Project ID",
         icon: { type: "notion", icon: "target", color: "gray" },
       },
       {
-        key: "initiatives",
-        title: "Linear Initiatives",
-        primaryKey: "Linear Initiative ID",
-        icon: { type: "notion", icon: "trophy", color: "gray" },
+        key: "issues",
+        title: "Linear Issues",
+        primaryKey: "Linear Issue ID",
+        icon: { type: "notion", icon: "checkmark-square", color: "gray" },
       },
     ]
   )
@@ -338,6 +481,17 @@ test("worker manifest preserves databases, sync schedules, and shared pacing", (
     })),
     [
       {
+        key: "initiatives",
+        firstSixProperties: [
+          "Name",
+          "Status",
+          "Health",
+          "Owner",
+          "Initiative Link",
+          "Project Count",
+        ],
+      },
+      {
         key: "projects",
         firstSixProperties: [
           "Name",
@@ -349,14 +503,14 @@ test("worker manifest preserves databases, sync schedules, and shared pacing", (
         ],
       },
       {
-        key: "initiatives",
+        key: "issues",
         firstSixProperties: [
-          "Name",
+          "Title",
+          "Issue Key",
           "Status",
-          "Health",
-          "Owner",
-          "Initiative Link",
-          "Project Count",
+          "Priority",
+          "Assignee",
+          "Issue Link",
         ],
       },
     ]
@@ -367,6 +521,40 @@ test("worker manifest preserves databases, sync schedules, and shared pacing", (
       ?.config.schema.properties ?? {}
   assert.equal("Priority" in initiativeProperties, false)
   assert.equal("Canceled" in initiativeProperties, false)
+
+  // Select properties declared with an empty option list silently drop every
+  // value they are given, which is how Status/Teams/Labels first shipped blank.
+  for (const database of worker.manifest.databases) {
+    for (const [name, property] of Object.entries(
+      database.config.schema.properties
+    )) {
+      const configuration = property as { type: string; options?: unknown[] }
+      if (
+        configuration.type !== "select" &&
+        configuration.type !== "multi_select"
+      ) {
+        continue
+      }
+      assert.ok(
+        (configuration.options?.length ?? 0) > 0,
+        `${database.key}.${name} declares no select options`
+      )
+      const foldedNames = new Set<string>()
+      for (const option of configuration.options ?? []) {
+        const optionName = (option as { name?: string }).name?.trim()
+        assert.ok(
+          optionName,
+          `${database.key}.${name} declares an unnamed select option`
+        )
+        const folded = optionName.toLocaleLowerCase()
+        assert.ok(
+          !foldedNames.has(folded),
+          `${database.key}.${name} declares duplicate option "${optionName}"`
+        )
+        foldedNames.add(folded)
+      }
+    }
+  }
 
   type SyncManifestConfig = {
     databaseKey: string
@@ -388,14 +576,38 @@ test("worker manifest preserves databases, sync schedules, and shared pacing", (
       {
         key: "projectsSync",
         databaseKey: "projects",
+        mode: "incremental",
+        schedule: { type: "interval", intervalMs: 60 * 60_000 },
+      },
+      {
+        key: "projectsReconciliationSync",
+        databaseKey: "projects",
         mode: "replace",
-        schedule: { type: "interval", intervalMs: 15 * 60_000 },
+        schedule: { type: "interval", intervalMs: 24 * 60 * 60_000 },
+      },
+      {
+        key: "issuesSync",
+        databaseKey: "issues",
+        mode: "incremental",
+        schedule: { type: "interval", intervalMs: 24 * 60 * 60_000 },
+      },
+      {
+        key: "issuesBackfill",
+        databaseKey: "issues",
+        mode: "replace",
+        schedule: { type: "manual" },
+      },
+      {
+        key: "releasesSync",
+        databaseKey: "issues",
+        mode: "incremental",
+        schedule: { type: "interval", intervalMs: 60 * 60_000 },
       },
       {
         key: "initiativesSync",
         databaseKey: "initiatives",
         mode: "replace",
-        schedule: { type: "interval", intervalMs: 60 * 60_000 },
+        schedule: { type: "interval", intervalMs: 24 * 60 * 60_000 },
       },
     ]
   )
@@ -459,6 +671,29 @@ test("content, person, cycle, and date helpers preserve useful values", () => {
     ]),
     ["Platform", "Product Core"]
   )
+  assert.equal(personEmail({ email: " ada@example.com " }), "ada@example.com")
+  assert.equal(personEmail({ email: "Ada" }), null)
+  assert.deepEqual(
+    labelSelectNames([{ name: "sdlc" }, { name: "platform,core" }, { name: "sdlc" }]),
+    ["sdlc", "platformcore"]
+  )
+  assert.equal(
+    milestoneSummary([
+      { name: "Beta", targetDate: "2026-06-01T00:00:00Z" },
+      { name: "GA", targetDate: null },
+      { name: "Beta", targetDate: "2026-06-01" },
+    ]),
+    "Beta (2026-06-01) · GA"
+  )
+  assert.equal(milestoneSummary([]), null)
+  assert.deepEqual(
+    relatedInitiativeIds([
+      { id: "keep", archivedAt: null },
+      { id: "drop", archivedAt: "2026-01-01T00:00:00Z" },
+      { id: "keep", archivedAt: null },
+    ]),
+    ["keep"]
+  )
   assert.deepEqual(
     linkedResourcesFromProject({
       externalLinks: {
@@ -477,6 +712,43 @@ test("content, person, cycle, and date helpers preserve useful values", () => {
   assert.equal(cycleDisplay({ name: " Sprint 20 ", number: 20 }), "Sprint 20")
   assert.equal(cycleDisplay({ name: "", number: 20 }), "Cycle 20")
   assert.equal(cycleDisplay(null), null)
+
+  const planned: LinearReleaseRef = {
+    id: "planned",
+    name: "10.4.8",
+    version: "10.4.8",
+    completedAt: null,
+    updatedAt: "2026-06-01T00:00:00Z",
+    archivedAt: null,
+    trashed: false,
+    stage: { name: "Planned", type: "planned" },
+    pipeline: { name: "iOS Clinician" },
+  }
+  const released: LinearReleaseRef = {
+    id: "released",
+    name: "10.4.7",
+    version: "10.4.7",
+    completedAt: "2026-06-11T00:00:00Z",
+    updatedAt: "2026-06-11T00:00:00Z",
+    archivedAt: null,
+    trashed: false,
+    stage: { name: "Released", type: "completed" },
+    pipeline: { name: "iOS Clinician" },
+  }
+  assert.equal(
+    pickCurrentRelease([released, planned])?.id,
+    "planned",
+    "an open train beats a shipped one"
+  )
+  assert.equal(pickCurrentRelease([released])?.id, "released")
+  assert.equal(pickCurrentRelease([{ ...released, trashed: true }]), null)
+  assert.equal(releaseDisplayName(planned), "10.4.8")
+  assert.equal(
+    releaseDisplayName({ ...planned, version: null, name: "Nightly" }),
+    "Nightly"
+  )
+  assert.ok((RELEASE_STAGE_OPTIONS as readonly string[]).includes("Planned"))
+  assert.ok((RELEASE_STAGE_OPTIONS as readonly string[]).includes("Released"))
 
   assert.equal(
     longFormContent("# Rich document", "description"),
@@ -612,7 +884,7 @@ test("project transform leads with its latest update and retains the overview", 
   assertPropertyContains(change.properties.Status, "Custom delivery name")
   assertPropertyContains(change.properties["Status Category"], "Started")
   assertPropertyContains(change.properties.Health, "At Risk")
-  assertPropertyContains(change.properties.Lead, "Ada")
+  assertPropertyContains(change.properties.Lead, "ada@example.com")
   assertPropertyContains(change.properties.Teams, "Platform")
   assertPropertyContains(change.properties.Teams, "Product Core")
   assertPropertyContains(change.properties["Project Link"], fullProject.url)
@@ -622,6 +894,17 @@ test("project transform leads with its latest update and retains the overview", 
     "https://www.notion.so/prd"
   )
   assertPropertyContains(change.properties["Linked Resources"], "Brief")
+  assertPropertyContains(
+    change.properties.Summary,
+    "Fallback project description"
+  )
+  assertPropertyContains(change.properties.Labels, "sdlc")
+  assertPropertyContains(change.properties.Labels, "platformcore")
+  assertPropertyContains(change.properties.Milestones, "Beta (2026-06-01)")
+  assertPropertyContains(change.properties.Milestones, "GA")
+  assert.deepEqual(change.properties["Related Initiative"], [
+    { type: "primaryKey", value: "33ac57a9-f846-44e8-9889-91f061409343" },
+  ])
   assert.match(change.pageContentMarkdown, /## Linked resources/)
   assert.match(change.pageContentMarkdown, /\[PRD\]\(https:\/\/www\.notion\.so\/prd\)/)
   assertPropertyContains(change.properties.Priority, "High")
@@ -654,6 +937,10 @@ test("project transform omits absent optional values and keeps zero progress", (
   assert.equal(minimal.properties.Lead, undefined)
   assert.equal(minimal.properties.Teams, undefined)
   assert.equal(minimal.properties["Linked Resources"], undefined)
+  assert.equal(minimal.properties.Summary, undefined)
+  assert.equal(minimal.properties.Labels, undefined)
+  assert.equal(minimal.properties.Milestones, undefined)
+  assert.equal(minimal.properties["Related Initiative"], undefined)
   assert.equal(minimal.properties.Priority, undefined)
   assert.equal(minimal.properties["Progress %"], undefined)
   assert.equal(minimal.properties["Last Update At"], undefined)
@@ -679,23 +966,44 @@ test("issue transform emits a full record, dedupes labels, and retains estimate 
 
   assert.equal(change.type, "upsert")
   assert.equal(change.key, fullIssue.id, "the immutable Linear UUID is the key")
-  assert.equal(change.upstreamUpdatedAt, fullIssue.updatedAt)
-  assert.equal(change.pageContentMarkdown, fullIssue.description)
+  assert.equal(
+    change.upstreamUpdatedAt,
+    fullIssue.releases.nodes[0]?.updatedAt,
+    "a newer release timestamp wins over issue.updatedAt"
+  )
+  assert.match(change.pageContentMarkdown, /Acceptance criteria/)
+  assert.match(
+    change.pageContentMarkdown,
+    /Resume from the saved cursor/,
+    "user markdown is escaped, not copied verbatim"
+  )
   assertPropertyContains(change.properties.Title, fullIssue.title)
   assertPropertyContains(change.properties["Issue Key"], "ENG-321")
-  assertPropertyContains(change.properties.Status, "In Progress")
+  assertPropertyContains(change.properties.Status, "In progress")
   assertPropertyContains(change.properties["Workflow Category"], "Started")
   assertPropertyContains(change.properties.Priority, "Urgent")
   assertPropertyContains(change.properties.Assignee, "Grace")
   assertPropertyContains(change.properties["Issue Link"], fullIssue.url)
   assertPropertyContains(change.properties.Team, "Engineering")
-  assertPropertyContains(change.properties.Project, "Launch Enterprise")
+  assertPropertyContains(
+    change.properties.Project,
+    fullIssue.project?.id ?? "",
+    // A relation reference, not the project name: the key is the projects
+    // database primary key, which is the Linear project UUID.
+  )
   assertPropertyContains(change.properties.Cycle, "Cycle 27")
   assert.equal(
     propertyText(change.properties.Labels).match(/backend/g)?.length,
-    1
+    1,
+    "duplicate labels collapse"
   )
-  assertPropertyContains(change.properties.Labels, "api")
+  // Rich text keeps the name exactly as Linear reports it, commas and all,
+  // because nothing has to match a declared option.
+  assertPropertyContains(change.properties.Labels, "backend · api, internal · needs  review")
+  assertPropertyContains(change.properties.Release, "10.4.8")
+  assertPropertyContains(change.properties["Release stage"], "Planned")
+  assert.equal(change.properties["Released at"], undefined)
+  assertPropertyContains(change.properties["Release pipeline"], "iOS Clinician")
   assertPropertyContains(change.properties.Estimate, "0")
   assertPropertyContains(change.properties.Updated, "20:21")
   assertPropertyContains(change.properties.Started, "04:05")
@@ -718,12 +1026,136 @@ test("issue transform handles a minimal record and cycle-number fallback", () =>
   assert.equal(change.properties.Project, undefined)
   assertPropertyContains(change.properties.Cycle, "Cycle 12")
   assert.equal(change.properties.Labels, undefined)
+  assert.equal(change.properties.Release, undefined)
+  assert.equal(change.properties["Release stage"], undefined)
+  assert.equal(change.properties["Released at"], undefined)
+  assert.equal(change.properties["Release pipeline"], undefined)
   assert.equal(change.properties.Estimate, undefined)
   assert.equal(change.properties["Due Date"], undefined)
   assert.equal(change.properties.Started, undefined)
   assert.equal(change.properties.Completed, undefined)
   assert.equal(change.properties.Canceled, undefined)
   assertPropertyContains(change.properties.Archived, "No")
+})
+
+test("every select value a transform emits is declared in the schema", () => {
+  const issue = issueToChange({
+    ...fullIssue,
+    // "duplicate" is a real workflow state type in Linear and was missing from
+    // the hardcoded category list this schema used to carry.
+    state: { name: ISSUE_STATUS_OPTIONS[0]!, type: "duplicate" },
+    team: { name: TEAM_OPTIONS[0]!, key: "T" },
+  })
+  assertSelectValuesAreDeclared("issues", issue.properties)
+
+  assertPropertyContains(issue.properties["Workflow Category"], "Duplicate")
+
+  const project = projectToChange({
+    ...fullProject,
+    status: { name: PROJECT_STATUS_OPTIONS[0]!, type: "started" },
+    teams: {
+      nodes: TEAM_OPTIONS.slice(0, 2).map((name) => ({ name, key: "T" })),
+      pageInfo: { hasNextPage: false, endCursor: null },
+    },
+    labels: {
+      nodes: PROJECT_LABEL_OPTIONS.slice(0, 3).map((name) => ({ name })),
+      pageInfo: { hasNextPage: false, endCursor: null },
+    },
+  })
+  assertSelectValuesAreDeclared("projects", project.properties)
+
+  assertSelectValuesAreDeclared("projects", projectToChange(minimalProject).properties)
+  assertSelectValuesAreDeclared("issues", issueToChange(minimalIssue).properties)
+})
+
+test("every Linear workflow state type maps to a declared category", () => {
+  // WorkflowState.type is an open string in Linear's schema rather than an
+  // enum, which is why this list is generated instead of hardcoded.
+  const stateTypes = [
+    "triage",
+    "backlog",
+    "unstarted",
+    "started",
+    "completed",
+    "canceled",
+    "duplicate",
+  ]
+
+  for (const type of stateTypes) {
+    const category = workflowCategoryLabel(type)
+    assert.ok(category, `${type} produced no category`)
+    assert.ok(
+      (WORKFLOW_CATEGORY_OPTIONS as readonly string[]).includes(category),
+      `${type} maps to "${category}", which src/options.ts does not declare`
+    )
+  }
+})
+
+test("the option generator and the issue transform normalize names identically", () => {
+  // scripts/generate-options.mts imports these same helpers, so whatever they
+  // return is both what gets declared and what gets emitted.
+  const rawTeam = "Growth,  EMEA"
+  const rawStatus = "Ready, blocked"
+  const rawProjectLabel = "Tier 1, internal"
+
+  const change = issueToChange({
+    ...fullIssue,
+    state: { name: rawStatus, type: "started" },
+    team: { name: rawTeam, key: "GRW" },
+  })
+
+  assert.deepEqual(selectValues(change.properties.Team), [
+    teamSelectName({ name: rawTeam, key: "GRW" }),
+  ])
+  assert.deepEqual(selectValues(change.properties.Status), [
+    selectName(rawStatus),
+  ])
+
+  const project = projectToChange({
+    ...fullProject,
+    teams: {
+      nodes: [{ name: rawTeam, key: "GRW" }],
+      pageInfo: { hasNextPage: false, endCursor: null },
+    },
+    labels: {
+      nodes: [{ name: rawProjectLabel }],
+      pageInfo: { hasNextPage: false, endCursor: null },
+    },
+  })
+
+  assert.deepEqual(
+    selectValues(project.properties.Labels),
+    labelSelectNames([{ name: rawProjectLabel }])
+  )
+  assert.deepEqual(
+    selectValues(project.properties.Teams),
+    teamSelectNames([{ name: rawTeam, key: "GRW" }])
+  )
+})
+
+test("case-only Linear statuses map to one Notion option", () => {
+  for (const [linearName, notionName] of [
+    ["In Progress", "In progress"],
+    ["ToDo", "Todo"],
+  ] as const) {
+    const change = issueToChange({
+      ...fullIssue,
+      state: { name: linearName, type: "started" },
+    })
+    assert.deepEqual(selectValues(change.properties.Status), [notionName])
+  }
+})
+
+test("issue page content is truncated like project page content", () => {
+  const description = "d".repeat(MAX_PAGE_SECTION_CHARACTERS + 500)
+  const change = issueToChange({ ...fullIssue, description })
+
+  assert.ok(
+    change.pageContentMarkdown.length < description.length,
+    "an unbounded page body is a write hazard and a backfill payload risk"
+  )
+  assert.match(change.pageContentMarkdown, /was shortened in Notion/)
+  assert.match(change.pageContentMarkdown, /Read the full description in Linear/)
 })
 
 test("issue sync changes turn soft-deleted records into immutable-key deletes", () => {
@@ -741,8 +1173,18 @@ test("issue sync changes turn soft-deleted records into immutable-key deletes", 
 test("first issue window starts at the epoch and leaves a consistency buffer", () => {
   const now = Date.parse("2026-06-30T12:00:00.000Z")
 
-  assert.deepEqual(issueIncrementalWindow(undefined, now), {
-    since: INITIAL_ISSUE_WATERMARK,
+  assert.deepEqual(incrementalWindow(undefined, now), {
+    since: INITIAL_WATERMARK,
+    until: new Date(now - CONSISTENCY_BUFFER_MS).toISOString(),
+  })
+})
+
+test("release freshness window starts at a lookback, not the epoch", () => {
+  const now = Date.parse("2026-06-30T12:00:00.000Z")
+  const lookback = new Date(now - RELEASE_SYNC_LOOKBACK_MS).toISOString()
+
+  assert.deepEqual(incrementalWindow(undefined, now, lookback), {
+    since: lookback,
     until: new Date(now - CONSISTENCY_BUFFER_MS).toISOString(),
   })
 })
@@ -756,7 +1198,7 @@ test("issue window remains pinned across every cursor page", () => {
   }
 
   assert.deepEqual(
-    issueIncrementalWindow(state, Date.parse("2027-01-01T00:00:00.000Z")),
+    incrementalWindow(state, Date.parse("2027-01-01T00:00:00.000Z")),
     {
       since: state.since,
       until: state.until,
@@ -767,15 +1209,15 @@ test("issue window remains pinned across every cursor page", () => {
 test("terminal issue watermark overlaps the completed window and validates it", () => {
   const until = "2026-06-30T12:00:00.000Z"
   assert.equal(
-    nextIssueWatermark(until),
+    nextWatermark(until),
     new Date(Date.parse(until) - WATERMARK_OVERLAP_MS).toISOString()
   )
   assert.equal(
-    nextIssueWatermark("1970-01-01T00:00:30.000Z"),
-    INITIAL_ISSUE_WATERMARK,
+    nextWatermark("1970-01-01T00:00:30.000Z"),
+    INITIAL_WATERMARK,
     "the overlap clamps at the epoch"
   )
-  assert.throws(() => nextIssueWatermark("not-a-timestamp"), /invalid end time/)
+  assert.throws(() => nextWatermark("not-a-timestamp"), /invalid end time/)
 })
 
 test("cursor state rejects missing, immediate, and longer repeated cursors", () => {
@@ -788,6 +1230,7 @@ test("cursor state rejects missing, immediate, and longer repeated cursors", () 
   assert.deepEqual(first, {
     after: "cursor-a",
     seenCursors: ["cursor-a"],
+    pages: 1,
   })
 
   assert.throws(
@@ -799,11 +1242,45 @@ test("cursor state rejects missing, immediate, and longer repeated cursors", () 
   assert.deepEqual(second, {
     after: "cursor-b",
     seenCursors: ["cursor-a", "cursor-b"],
+    pages: 2,
   })
   assert.throws(
     () => nextCursorState(second, "cursor-a", "projects"),
     /Linear projects pagination repeated cursor/,
     "serialized cursor history catches A -> B -> A loops"
+  )
+})
+
+test("cursor history is bounded and a runaway cycle still terminates", () => {
+  // An issue backfill runs into the thousands of pages, and every cursor is
+  // persisted between executions, so the history cannot grow without limit.
+  let state = nextCursorState(undefined, "cursor-0", "issues")
+  for (let page = 1; page < RETAINED_CURSORS + 25; page += 1) {
+    state = nextCursorState(state, `cursor-${page}`, "issues")
+  }
+
+  assert.equal(state.seenCursors.length, RETAINED_CURSORS)
+  assert.equal(state.pages, RETAINED_CURSORS + 25)
+  assert.equal(
+    state.seenCursors.includes("cursor-0"),
+    false,
+    "the oldest cursors roll out of the retained window"
+  )
+  assert.deepEqual(
+    nextCursorState(state, "cursor-0", "issues").after,
+    "cursor-0",
+    "a cursor outside the window no longer trips repeat detection"
+  )
+
+  // Which is why the page counter is the backstop for a cycle that loops.
+  assert.throws(
+    () =>
+      nextCursorState(
+        { after: "cursor-x", seenCursors: [], pages: MAX_CYCLE_PAGES },
+        "cursor-y",
+        "issues"
+      ),
+    new RegExp(`exceeded ${MAX_CYCLE_PAGES} pages in one cycle`)
   )
 })
 
@@ -939,6 +1416,20 @@ function projectConnection(
   })
 }
 
+function projectMilestonesConnection(
+  nodes: Array<{ name: string | null; targetDate: string | null }>,
+  hasNextPage: boolean,
+  endCursor: string | null
+): Response {
+  return Response.json({
+    data: {
+      project: {
+        projectMilestones: { nodes, pageInfo: { hasNextPage, endCursor } },
+      },
+    },
+  })
+}
+
 function initiativeConnection(
   nodes: LinearInitiative[],
   hasNextPage: boolean,
@@ -989,6 +1480,30 @@ function issueConnection(
   })
 }
 
+function releaseConnection(
+  nodes: LinearRelease[],
+  hasNextPage: boolean,
+  endCursor: string | null
+): Response {
+  return Response.json({
+    data: { releases: { nodes, pageInfo: { hasNextPage, endCursor } } },
+  })
+}
+
+function releaseIssuesConnection(
+  nodes: Array<{ id: string }>,
+  hasNextPage: boolean,
+  endCursor: string | null
+): Response {
+  return Response.json({
+    data: {
+      release: {
+        issues: { nodes, pageInfo: { hasNextPage, endCursor } },
+      },
+    },
+  })
+}
+
 test("GraphQL client uses the endpoint, POST body, and direct API-key authorization", async () => {
   process.env.LINEAR_API_KEY = "lin_api_test-secret"
   const calls: FetchCall[] = []
@@ -1010,15 +1525,19 @@ test("GraphQL client uses the endpoint, POST body, and direct API-key authorizat
   assert.equal(calls[0]?.redirect, "error")
   const projectQuery = calls[0]?.request.query ?? ""
   assert.match(projectQuery, /query Projects/)
-  assert.match(projectQuery, /orderBy: createdAt/)
+  assert.match(projectQuery, /orderBy: \$orderBy/)
   assert.match(
     projectQuery,
     /lastUpdate\s*{[\s\S]*?body[\s\S]*?createdAt[\s\S]*?updatedAt[\s\S]*?url[\s\S]*?user\s*{[\s\S]*?name[\s\S]*?displayName/
   )
-  assert.match(projectQuery, /teams\(first: 50\)/)
-  assert.match(projectQuery, /externalLinks\(first: 50\)/)
-  assert.match(projectQuery, /documents\(first: 50\)/)
-  assert.deepEqual(calls[0]?.request.variables, {})
+  assert.match(projectQuery, /teams\(first: 10\)/)
+  assert.match(projectQuery, /labels\(first: 10\)/)
+  assert.match(projectQuery, /projectMilestones\(first: 10\)/)
+  assert.match(projectQuery, /initiatives\(first: 5\)/)
+  assert.match(projectQuery, /externalLinks\(first: 10\)/)
+  assert.match(projectQuery, /documents\(first: 10\)/)
+  assert.match(projectQuery, /lead\s*{[\s\S]*?email/)
+  assert.deepEqual(calls[0]?.request.variables, { orderBy: "createdAt" })
 })
 
 test("project and initiative connections expose durable cursor pages", async () => {
@@ -1035,10 +1554,9 @@ test("project and initiative connections expose durable cursor pages", async () 
   )
 
   const firstProjects = await fetchProjectsPage(noPacing)
-  const finalProjects = await fetchProjectsPage(
-    noPacing,
-    firstProjects.nextCursor
-  )
+  const finalProjects = await fetchProjectsPage(noPacing, {
+    after: firstProjects.nextCursor,
+  })
   const firstInitiatives = await fetchInitiativesPage(noPacing)
   const finalInitiatives = await fetchInitiativesPage(
     noPacing,
@@ -1069,9 +1587,14 @@ test("project and initiative connections expose durable cursor pages", async () 
   })
   assert.deepEqual(
     calls.map((call) => call.request.variables),
-    [{}, { after: "project-page-2" }, {}, { after: "initiative-page-2" }]
+    [
+      { orderBy: "createdAt" },
+      { orderBy: "createdAt", after: "project-page-2" },
+      {},
+      { after: "initiative-page-2" },
+    ]
   )
-  assert.match(calls[0]?.request.query ?? "", /orderBy: createdAt/)
+  assert.match(calls[0]?.request.query ?? "", /orderBy: \$orderBy/)
   const initiativeQuery = calls[2]?.request.query ?? ""
   assert.match(initiativeQuery, /orderBy: createdAt/)
   assert.match(initiativeQuery, /initiatives\([\s\S]*?first: 20/)
@@ -1255,6 +1778,44 @@ test("issue requests pin the incremental updatedAt window in GraphQL variables",
   })
 })
 
+test("project requests pin the incremental updatedAt window in GraphQL variables", async () => {
+  process.env.LINEAR_API_KEY = "test-key"
+  const calls: FetchCall[] = []
+  installQueuedGraphQLFetch(
+    [projectConnection([minimalProject], false, null)],
+    calls
+  )
+
+  const page = await fetchProjectsPage(noPacing, {
+    after: "project-page-3",
+    updatedSince: "2026-06-01T00:00:00.000Z",
+    updatedBefore: "2026-07-01T00:00:00.000Z",
+  })
+
+  assert.equal(page.resources[0]?.id, minimalProject.id)
+  assert.deepEqual(calls[0]?.request.variables, {
+    orderBy: "updatedAt",
+    after: "project-page-3",
+    filter: {
+      updatedAt: {
+        gte: "2026-06-01T00:00:00.000Z",
+        lt: "2026-07-01T00:00:00.000Z",
+      },
+    },
+  })
+})
+
+test("project sync changes turn soft-deleted records into deletes", () => {
+  assert.deepEqual(projectToSyncChange({ ...minimalProject, trashed: true }), {
+    type: "delete",
+    key: minimalProject.id,
+  })
+
+  const upsert = projectToSyncChange(minimalProject)
+  assert.equal(upsert.type, "upsert")
+  assert.equal(upsert.key, minimalProject.id)
+})
+
 test("connection pagination rejects a missing next cursor", async () => {
   process.env.LINEAR_API_KEY = "test-key"
   installQueuedGraphQLFetch([projectConnection([], true, null)], [])
@@ -1270,7 +1831,7 @@ test("connection pagination rejects a repeated cursor", async () => {
   installQueuedGraphQLFetch([projectConnection([], true, "project-page-2")], [])
 
   await assert.rejects(
-    () => fetchProjectsPage(noPacing, "project-page-2"),
+    () => fetchProjectsPage(noPacing, { after: "project-page-2" }),
     /Linear projects pagination repeated cursor/
   )
 })
@@ -1424,7 +1985,13 @@ test("nested issue labels are fully paginated, deduped, and paced per request", 
   assert.match(calls[0]?.request.query ?? "", /query Issues/)
   assert.match(
     calls[0]?.request.query ?? "",
-    /labels\(first: 50, includeArchived: true\)/
+    // Issues and initiatives no longer share a page-size constant, so tuning
+    // the issue label page cannot silently retune the initiative queries.
+    /labels\(first: 20, includeArchived: true\)/
+  )
+  assert.match(
+    calls[0]?.request.query ?? "",
+    /releases\(first: 10, orderBy: updatedAt, includeArchived: true\)/
   )
   assert.deepEqual(calls[0]?.request.variables, { orderBy: "createdAt" })
   assert.match(calls[1]?.request.query ?? "", /query IssueLabels/)
@@ -1482,4 +2049,287 @@ test("nested label safety bound rejects instead of returning truncated labels", 
     21,
     "one issue request plus exactly 20 label requests"
   )
+})
+
+test("issue transform writes Released at when the train has shipped", () => {
+  const change = issueToChange({
+    ...fullIssue,
+    releases: {
+      nodes: [
+        {
+          id: "rel-ios-1047",
+          name: "10.4.7",
+          version: "10.4.7",
+          completedAt: "2026-06-11T16:00:00.000Z",
+          updatedAt: "2026-06-11T16:00:00.000Z",
+          archivedAt: null,
+          trashed: false,
+          stage: { name: "Released", type: "completed" },
+          pipeline: { name: "iOS Clinician" },
+        },
+      ],
+      pageInfo: { hasNextPage: false, endCursor: null },
+    },
+  })
+
+  assertPropertyContains(change.properties.Release, "10.4.7")
+  assertPropertyContains(change.properties["Release stage"], "Released")
+  assertPropertyContains(change.properties["Released at"], "2026-06-11")
+  assert.deepEqual(selectValues(change.properties["Release stage"]), [
+    "Released",
+  ])
+})
+
+test("release issues paginate, then related issues are fetched by id", async () => {
+  process.env.LINEAR_API_KEY = "test-key"
+  const calls: FetchCall[] = []
+  let pacingCount = 0
+  const release: LinearRelease = {
+    id: "rel-ios-1048",
+    updatedAt: "2026-06-30T21:00:00.000Z",
+    issues: {
+      nodes: [{ id: "issue-1" }],
+      pageInfo: { hasNextPage: true, endCursor: "release-issue-2" },
+    },
+  }
+
+  installQueuedGraphQLFetch(
+    [
+      releaseConnection([release], false, null),
+      releaseIssuesConnection([{ id: "issue-2" }, { id: "issue-1" }], false, null),
+      issueConnection(
+        [
+          { ...minimalIssue, id: "issue-1" },
+          { ...minimalIssue, id: "issue-2" },
+        ],
+        false,
+        null
+      ),
+    ],
+    calls
+  )
+
+  const page = await fetchReleasesPage(async () => {
+    pacingCount++
+  })
+  assert.deepEqual(
+    page.resources[0]?.issues.nodes.map((issue) => issue.id),
+    ["issue-1", "issue-2"]
+  )
+  assert.equal(pacingCount, 2, "the release page and the issue-id page are paced")
+  assert.match(calls[0]?.request.query ?? "", /query Releases/)
+  assert.match(calls[0]?.request.query ?? "", /issues\(first: 50, includeArchived: true\)/)
+  assert.match(calls[1]?.request.query ?? "", /query ReleaseIssues/)
+
+  const related = await fetchIssuesByIds(async () => {
+    pacingCount++
+  }, ["issue-1", "issue-2", "issue-1"])
+  assert.deepEqual(
+    related.map((issue) => issue.id),
+    ["issue-1", "issue-2"]
+  )
+  assert.equal(pacingCount, 3)
+  assert.deepEqual(calls[2]?.request.variables, {
+    orderBy: "createdAt",
+    filter: { id: { in: ["issue-1", "issue-2"] } },
+  })
+})
+
+test("nested release-issue safety bound rejects instead of returning a truncated train", async () => {
+  process.env.LINEAR_API_KEY = "test-key"
+  const release: LinearRelease = {
+    id: "rel-huge",
+    updatedAt: "2026-06-30T21:00:00.000Z",
+    issues: {
+      nodes: [],
+      pageInfo: { hasNextPage: true, endCursor: "release-issue-1" },
+    },
+  }
+  const followUpPages = Array.from(
+    { length: MAX_NESTED_RELEASE_ISSUE_REQUESTS_PER_PAGE },
+    (_, index) =>
+      releaseIssuesConnection(
+        [{ id: `issue-${index + 1}` }],
+        true,
+        `release-issue-${index + 2}`
+      )
+  )
+  installQueuedGraphQLFetch(
+    [releaseConnection([release], false, null), ...followUpPages],
+    []
+  )
+
+  await assert.rejects(
+    () => fetchReleasesPage(async () => {}),
+    /exceeded 80 follow-up requests/
+  )
+})
+
+test("fetchIssuesByIds is a no-op for an empty id list", async () => {
+  process.env.LINEAR_API_KEY = "test-key"
+  let called = false
+  globalThis.fetch = (async () => {
+    called = true
+    return Response.json({ data: {} })
+  }) as typeof fetch
+
+  assert.deepEqual(await fetchIssuesByIds(async () => {}, []), [])
+  assert.equal(called, false)
+})
+
+// A release project defines a milestone per dev workstream and finishes with
+// EA and GA. Truncating at the nested page size drops exactly the two dates
+// downstream launch automations read.
+test("project milestones paginate past the nested page size", async () => {
+  process.env.LINEAR_API_KEY = "test-key"
+  let pacingCount = 0
+  const calls: FetchCall[] = []
+  const project: LinearProject = {
+    ...minimalProject,
+    projectMilestones: {
+      nodes: Array.from({ length: 10 }, (_, index) => ({
+        name: `Dev - Workstream ${index + 1}`,
+        targetDate: "2026-08-31",
+      })),
+      pageInfo: { hasNextPage: true, endCursor: "milestone-page-2" },
+    },
+  }
+  installQueuedGraphQLFetch(
+    [
+      projectConnection([project], false, null),
+      projectMilestonesConnection(
+        [{ name: "Dev Complete", targetDate: "2026-11-30" }],
+        true,
+        "milestone-page-3"
+      ),
+      projectMilestonesConnection(
+        [
+          { name: "Early Access (start)", targetDate: "2026-11-18" },
+          { name: "General Availability (start)", targetDate: "2026-11-30" },
+        ],
+        false,
+        null
+      ),
+    ],
+    calls
+  )
+
+  const page = await fetchProjectsPage(async () => {
+    pacingCount++
+  })
+
+  const milestones = page.resources[0]?.projectMilestones.nodes ?? []
+  assert.equal(milestones.length, 13)
+  assert.deepEqual(
+    milestones.slice(-2).map((milestone) => milestone.name),
+    ["Early Access (start)", "General Availability (start)"]
+  )
+  assert.equal(
+    pacingCount,
+    3,
+    "the project page and both milestone pages are paced"
+  )
+  assert.equal(calls.length, 3)
+  assert.match(calls[0]?.request.query ?? "", /query Projects/)
+  assert.match(calls[1]?.request.query ?? "", /query ProjectMilestones/)
+  assert.match(
+    calls[1]?.request.query ?? "",
+    /projectMilestones\(first: 10, after: \$after\)/
+  )
+  assert.deepEqual(calls[1]?.request.variables, {
+    projectId: minimalProject.id,
+    after: "milestone-page-2",
+  })
+  assert.deepEqual(calls[2]?.request.variables, {
+    projectId: minimalProject.id,
+    after: "milestone-page-3",
+  })
+
+  const change = projectToChange(page.resources[0] as LinearProject)
+  assertPropertyContains(
+    change.properties.Milestones,
+    "Early Access (start) (2026-11-18)"
+  )
+  assertPropertyContains(
+    change.properties.Milestones,
+    "General Availability (start) (2026-11-30)"
+  )
+})
+
+test("nested project milestone pagination rejects unusable cursors", async (t) => {
+  await t.test("missing cursor", async () => {
+    process.env.LINEAR_API_KEY = "test-key"
+    const project: LinearProject = {
+      ...minimalProject,
+      projectMilestones: {
+        nodes: [{ name: "Early Access", targetDate: "2026-11-18" }],
+        pageInfo: { hasNextPage: true, endCursor: null },
+      },
+    }
+    installQueuedGraphQLFetch([projectConnection([project], false, null)], [])
+
+    await assert.rejects(
+      () => fetchProjectsPage(noPacing),
+      /projectMilestones pagination is missing endCursor/
+    )
+  })
+
+  await t.test("repeated cursor", async () => {
+    process.env.LINEAR_API_KEY = "test-key"
+    const project: LinearProject = {
+      ...minimalProject,
+      projectMilestones: {
+        nodes: [],
+        pageInfo: { hasNextPage: true, endCursor: "milestone-page-2" },
+      },
+    }
+    installQueuedGraphQLFetch(
+      [
+        projectConnection([project], false, null),
+        projectMilestonesConnection([], true, "milestone-page-2"),
+      ],
+      []
+    )
+
+    await assert.rejects(
+      () => fetchProjectsPage(noPacing),
+      /projectMilestones pagination repeated cursor/
+    )
+  })
+})
+
+test("nested milestone safety bound rejects instead of returning truncated milestones", async () => {
+  process.env.LINEAR_API_KEY = "test-key"
+  let pacingCount = 0
+  const project: LinearProject = {
+    ...minimalProject,
+    projectMilestones: {
+      nodes: [],
+      pageInfo: { hasNextPage: true, endCursor: "milestone-page-1" },
+    },
+  }
+  const followUpPages = Array.from(
+    { length: MAX_NESTED_MILESTONE_REQUESTS_PER_PAGE },
+    (_, index) =>
+      projectMilestonesConnection(
+        [{ name: `Milestone ${index + 1}`, targetDate: null }],
+        true,
+        `milestone-page-${index + 2}`
+      )
+  )
+  installQueuedGraphQLFetch(
+    [projectConnection([project], false, null), ...followUpPages],
+    []
+  )
+
+  await assert.rejects(
+    () =>
+      fetchProjectsPage(async () => {
+        pacingCount++
+      }),
+    new RegExp(
+      `exceeded ${MAX_NESTED_MILESTONE_REQUESTS_PER_PAGE} follow-up requests`
+    )
+  )
+  assert.equal(pacingCount, 1 + MAX_NESTED_MILESTONE_REQUESTS_PER_PAGE)
 })

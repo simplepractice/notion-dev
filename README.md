@@ -1,147 +1,218 @@
-# Worker sync: Linear
+# Linear → Notion worker (SimplePractice)
 
-Bring Linear projects, issues, and initiatives into Notion so product,
-engineering, and leadership teams can review execution and strategy together.
-The worker creates and maintains all three databases for you, while preserving
-links back to Linear for day-to-day work.
+A Notion Worker that copies Linear projects, issues, and initiatives into
+managed Notion databases for XFN stakeholders. This is a fork of Notion's
+Linear cookbook template, not a self-hosted sync.
+
+## Why projects are incremental
+
+A full hourly replacement of ~1,100 projects was too expensive for how
+little the data actually changes.
+
+Linear's per-request complexity cap forced the project GraphQL page size
+down to 20 (from the cookbook's 50). At that size a complete sweep is ~56
+paginated runs. Hourly replacement therefore cost ~1,340 runs/day, almost
+all of it rewriting unchanged rows. Linear showed ~2 project updates in
+an hour and ~13 in a day.
+
+The worker therefore uses the same pattern as the cookbook's issue sync:
+
+| Sync                           | Mode        | Schedule | What it does                                                                 |
+| ------------------------------ | ----------- | -------- | ---------------------------------------------------------------------------- |
+| `projectsSync`                 | incremental | Hourly   | Fetch only projects whose `updatedAt` falls in a pinned window               |
+| `projectsReconciliationSync`   | replace     | Daily    | Full sweep: repair drift and remove hard deletes the watermark cannot see    |
+| `issuesSync`                   | incremental | Daily    | Same shape, at issue volume. Also does the initial population (see below)    |
+| `issuesBackfill`               | replace     | Manual   | Full sweep, run on demand. A daily sweep at issue volume is not affordable    |
+| `releasesSync`                 | incremental | Hourly   | Walk recently updated Linear releases and rewrite related issue rows         |
+| `initiativesSync`              | replace     | Daily    | Full sweep. Membership of contributing projects has no safe monotonic clock |
+
+The hourly delta pins an upper bound for every page in the cycle, lags
+that bound by a 15-second consistency buffer, and overlaps the previous
+watermark by 60 seconds. Replaying a small interval is safe because
+upserts are keyed by Linear UUID. Soft-deleted (`trashed`) projects
+become explicit deletes on the incremental path. Archiving bumps
+`updatedAt` and rides the hourly delta.
+
+**Trade-off:** a project hard-deleted in Linear can linger in Notion until
+the next daily reconciliation. If a day is too long, lower the
+reconciliation interval; that is cheaper than returning projects to a
+full hourly replace.
+
+After deploy, reset `projectsSync` state before the first incremental
+run. Replace-mode cursors are `createdAt`-ordered and are not valid
+against an `updatedAt` window.
+
+## Why issues have no scheduled sweep
+
+Projects can afford a daily full sweep because there are ~1,100 of them.
+Issues are two orders of magnitude larger, so a daily replace would
+rewrite the entire database every 24 hours for no benefit.
+
+The daily delta covers creates, updates, archives, and soft deletes on
+its own: all of them move `updatedAt`, and a trashed issue emits an
+explicit delete. The workspace produces roughly 120 issue updates an
+hour, so a normal daily cycle is roughly 29 pages at the current rate.
+
+`issuesSync` also performs the **initial population**. `since` starts at
+the epoch and `until` is pinned across the cycle, so the first cycle is
+one continuous chained walk of every issue in the workspace. Expect it to
+run for hours. Do not add an initial lookback to `incrementalWindow`;
+with a manual-only backfill, that would leave the database holding an
+hour of activity and nothing else.
+
+`issuesBackfill` is a repair tool, not a schedule. Run it after adding a
+property or regenerating `src/options.ts`, so existing rows pick up the
+new values, or to clear an issue hard-deleted outside a delta window:
+
+```sh
+ntn workers sync trigger issuesBackfill
+```
+
+**Trade-off:** an issue destroyed in Linear without passing through trash
+lingers until someone runs the backfill.
+
+## Why releases rewrite issues
+
+Linear `Done` is a bad proxy for mobile. An iOS Clinician ticket can sit
+in Done for weeks while its release is still **Planned** (10.4.8), then
+move to **Released** (10.4.7 on Sep 11) when App Store review finishes.
+That stage change lives on the release, not the issue, and may not bump
+`issue.updatedAt`.
+
+`issuesSync` and `issuesBackfill` already read `Issue.releases` and write
+**Release**, **Release stage**, **Released at**, and **Release pipeline**.
+`releasesSync` is the freshness path: each hour it fetches releases whose
+`updatedAt` is in a pinned window and re-upserts the issues on those
+releases. The first cycle looks back seven days, not the epoch, so it
+does not refetch every issue that ever sat on a release.
+
+After adding these properties, run the backfill once so existing mobile
+rows pick up their current Planned/Released values:
+
+```sh
+ntn workers sync trigger issuesBackfill
+```
 
 ## Quickstart
 
-You need Node.js 22+, a
-[Linear personal API key](#getting-a-linear-personal-api-key), and a Linear
-user who can read the work you want to sync. Create a key in **Linear >
-Settings > Security & access > API keys**, then run these commands from the
-repository root:
+You need Node.js 22+ and a
+[Linear personal API key](#getting-a-linear-personal-api-key) whose user
+can read the work you want to copy. Create the key in **Linear >
+Settings > Security & access > API keys** (read is sufficient).
 
 ```sh
 npm install --global ntn
-cd workers/templates/linear-sync
+cd /Users/noah/dev/work/notion-dev
 npm install
 ntn login
-ntn workers deploy --name linear-sync
+# If `ntn workers` fails with "No workspace selected", unset NOTION_API_TOKEN.
+# A bot token in the environment overrides user login and cannot manage Workers.
+unset NOTION_API_TOKEN
+ntn workers deploy
 ntn workers env set LINEAR_API_KEY=lin_api_your-key-here
 ```
 
-Preview the issue sync without writing to Notion:
-
-```sh
-ntn workers sync trigger issuesSync --preview
-```
-
-Then create and populate the three databases immediately:
+Populate immediately (bypass the schedule):
 
 ```sh
 ntn workers sync trigger projectsSync
+ntn workers sync trigger projectsReconciliationSync
 ntn workers sync trigger issuesSync
+ntn workers sync trigger releasesSync
 ntn workers sync trigger initiativesSync
 ```
 
-The worker keeps them current automatically: issues every five minutes,
-projects every 15 minutes, and initiatives every hour. A daily issue sweep
-repairs drift and removes records that Linear has permanently deleted.
+`issuesSync`'s first cycle walks the whole workspace and takes hours.
+Watch it with `ntn workers sync status`.
 
-Everything visible to the Linear API key can be copied, including project and
-initiative update narratives. Review the destination databases' Notion sharing
-settings before giving a broader audience access.
+Everything visible to the API key is copied, including archived records.
+Filter in Notion rather than in the worker.
 
 ## What you can answer
 
-| Managed database       | Questions it helps answer                                                                                                          |
-| ---------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
-| **Linear Projects**    | Which projects are at risk or approaching their target date? Which projects lack a lead, priority, or recent status update?        |
-| **Linear Issues**      | What is overdue, high priority, or unassigned? How is active work distributed across teams, projects, cycles, and workflow stages? |
-| **Linear Initiatives** | Which initiatives are at risk or approaching their target date? Which strategic initiatives have no contributing projects?         |
+| Managed database       | Questions it helps answer                                                                                                   |
+| ---------------------- | --------------------------------------------------------------------------------------------------------------------------- |
+| **Linear Projects**    | Which projects are at risk or approaching their target date? Who owns them, which teams, which initiative, which milestones? |
+| **Linear Issues**      | What is in flight on a team or in a cycle, who owns it, how it rolls up to a project, and whether a mobile issue is Planned or Released. |
+| **Linear Initiatives** | Which initiatives are at risk or approaching their target date? Which strategic initiatives have no contributing projects?  |
 
 ## Reference
 
 ### Synced databases and schedules
 
-Three databases are maintained by four syncs:
+Three databases are maintained by six syncs:
 
-| Database               | Sync                       | Mode        | Schedule     |
-| ---------------------- | -------------------------- | ----------- | ------------ |
-| **Linear Projects**    | `projectsSync`             | replace     | Every 15 min |
-| **Linear Issues**      | `issuesSync`               | incremental | Every 5 min  |
-| **Linear Issues**      | `issuesReconciliationSync` | replace     | Daily        |
-| **Linear Initiatives** | `initiativesSync`          | replace     | Every hour   |
+| Database               | Sync                         | Mode        | Schedule |
+| ---------------------- | ---------------------------- | ----------- | -------- |
+| **Linear Projects**    | `projectsSync`               | incremental | Hourly   |
+| **Linear Projects**    | `projectsReconciliationSync` | replace     | Daily    |
+| **Linear Issues**      | `issuesSync`                 | incremental | Daily    |
+| **Linear Issues**      | `issuesBackfill`             | replace     | Manual   |
+| **Linear Issues**      | `releasesSync`               | incremental | Hourly   |
+| **Linear Initiatives** | `initiativesSync`            | replace     | Daily    |
 
-The two issue syncs intentionally target the same managed database. The fast
-incremental sync keeps active work current; the daily replacement sweep repairs
-drift and removes records that Linear has permanently deleted.
-
-The databases are otherwise independent. Project, initiative, team, and cycle
-names are stored as readable values instead of Notion relations. This keeps
-the example reliable when resources have different visibility, are synced on
-different schedules, or are archived and deleted in a different order.
+Syncs that share a database target the same managed database.
+Declaration order matters: initiatives first so projects can relate to
+them, projects before issues so issues can relate to projects.
 
 #### Linear Projects
 
-| Notion property   | Linear field                           | Type     |
-| ----------------- | -------------------------------------- | -------- |
-| Name              | `name`                                 | title    |
-| Status            | workspace-specific `status.name`       | select   |
-| Health            | `health`                               | select   |
-| Lead              | `lead.displayName` or `lead.name`      | richText |
-| Project Link      | `url`                                  | url      |
-| Progress %        | `progress` converted from 0–1 to 0–100 | number   |
-| Target Date       | `targetDate`                           | date     |
-| Updated           | `updatedAt`                            | date     |
-| Last Update At    | `lastUpdate.updatedAt`                 | date     |
-| Last Update Link  | `lastUpdate.url`                       | url      |
-| Status Category   | canonical category from `status.type`  | select   |
-| Priority          | `priorityLabel` or `priority`          | select   |
-| Start Date        | `startDate`                            | date     |
-| Started           | `startedAt`                            | date     |
-| Completed         | `completedAt`                          | date     |
-| Canceled          | `canceledAt`                           | date     |
-| Created           | `createdAt`                            | date     |
-| Archived          | whether `archivedAt` is set            | checkbox |
-| Slug ID           | `slugId`                               | richText |
-| Linear Project ID | `id`                                   | richText |
+| Notion property      | Linear field                                      | Type        |
+| -------------------- | ------------------------------------------------- | ----------- |
+| Name                 | `name`                                            | title       |
+| Status               | workspace-specific `status.name`                  | select      |
+| Health               | `health`                                          | select      |
+| Lead                 | `lead.email`                                      | people      |
+| Teams                | `teams.nodes[].name` (or `key`)                   | multiSelect |
+| Project Link         | `url`                                             | url         |
+| Linked Resources     | `externalLinks` and `documents`                   | file        |
+| Summary              | short `description`                               | richText    |
+| Related Initiative   | non-archived `initiatives.nodes[].id`             | relation    |
+| Labels               | `labels.nodes[].name`                             | multiSelect |
+| Milestones           | `projectMilestones` names with target dates       | richText    |
+| Progress %           | `progress` converted from 0–1 to 0–100            | number      |
+| Target Date          | `targetDate`                                      | date        |
+| Updated              | `updatedAt`                                       | date        |
+| Last Update At       | `lastUpdate.updatedAt`                            | date        |
+| Last Update Link     | `lastUpdate.url`                                  | url         |
+| Status Category      | canonical category from `status.type`             | select      |
+| Priority             | `priorityLabel` or `priority`                     | select      |
+| Start Date           | planned `startDate`                               | date        |
+| Started              | timestamp the project entered a started status    | date        |
+| Completed            | `completedAt`                                     | date        |
+| Canceled             | `canceledAt`                                      | date        |
+| Created              | `createdAt`                                       | date        |
+| Archived             | whether `archivedAt` is set                       | checkbox    |
+| Slug ID              | `slugId`                                          | richText    |
+| Linear Project ID    | `id`                                              | richText    |
 
-Each project page body starts with the latest status-update narrative, author,
-date, and source link, followed by Linear's richer `content` field (or
-`description` fallback). **Status** preserves the team's custom name, while
-**Status Category** provides a stable cross-project rollup. Update edits also
-participate in the sync freshness watermark.
+Each project page body starts with the latest status-update narrative,
+then Linear's richer `content` (or `description` fallback), then linked
+resources. **Status** preserves the team's custom name; **Status
+Category** is the stable rollup. **Start Date** is the planned date;
+**Started** is when Linear recorded the project actually starting.
 
-**Linear Project ID**, the immutable UUID, is the primary key. **Slug ID**
-remains visible for recognition and cross-referencing but is not used for
-identity because human-readable identifiers can change.
+**Linear Project ID**, the immutable UUID, is the primary key.
 
-#### Linear Issues
+**Select options must be declared up front.** Notion silently drops
+select and multi-select writes whose option is missing from the schema.
+See [Generated select options](#generated-select-options).
 
-| Notion property   | Linear field                         | Type        |
-| ----------------- | ------------------------------------ | ----------- |
-| Title             | `title`                              | title       |
-| Issue Key         | `identifier` (for example, ENG-123)  | richText    |
-| Status            | workspace-specific `state.name`      | select      |
-| Priority          | `priorityLabel` or `priority`        | select      |
-| Assignee          | `assignee.displayName` or `name`     | richText    |
-| Issue Link        | `url`                                | url         |
-| Updated           | `updatedAt`                          | date        |
-| Workflow Category | canonical category from `state.type` | select      |
-| Team              | `team.name` or `team.key`            | select      |
-| Project           | `project.name`                       | select      |
-| Cycle             | `cycle.name` or cycle number         | select      |
-| Labels            | all `labels.nodes[].name`            | multiSelect |
-| Estimate          | `estimate`                           | number      |
-| Due Date          | `dueDate`                            | date        |
-| Started           | `startedAt`                          | date        |
-| Completed         | `completedAt`                        | date        |
-| Canceled          | `canceledAt`                         | date        |
-| Created           | `createdAt`                          | date        |
-| Archived          | whether `archivedAt` is set          | checkbox    |
-| Linear Issue ID   | `id`                                 | richText    |
+**Milestones** are rich text, not multi-select. Milestone names are
+freeform per project (hundreds of distinct values) and would not be a
+usable dropdown. They render as `Beta (2026-06-01) · GA`.
 
-Each issue page body contains its Markdown `description`. Workspace-specific
-workflow names remain visible in **Status**, while **Workflow Category** makes
-cross-team reporting consistent. Labels are paginated rather than silently
-stopping at the first nested page.
+Every milestone is synced, not just the first nested page. Milestones are
+the one project connection that routinely runs past the nested page size —
+a release project carries one per dev workstream and finishes with EA and
+GA — so the client paginates `projectMilestones` to completion. Truncating
+here would silently drop the trailing EA/GA dates that downstream launch
+automations read, and a missing milestone is indistinguishable from one
+that was never defined. The walk is bounded per project page and fails the
+page rather than returning a short list.
 
-**Linear Issue ID**, the immutable UUID, is the primary key. The familiar
-**Issue Key** stays prominent, but it can change when an issue moves between
-teams, so it is not safe as a sync key.
+**Related Initiative** is a two-way relation onto the initiatives
+database (`Projects` on the initiative side).
 
 #### Linear Initiatives
 
@@ -150,7 +221,7 @@ teams, so it is not safe as a sync key.
 | Name                 | `name`                        | title    |
 | Status               | `status`                      | select   |
 | Health               | `health`                      | select   |
-| Owner                | `owner.displayName` or `name` | richText |
+| Owner                | `owner.email` when present    | people   |
 | Initiative Link      | `url`                         | url      |
 | Project Count        | all contributing `projects`   | number   |
 | Target Date          | `targetDate`                  | date     |
@@ -164,116 +235,271 @@ teams, so it is not safe as a sync key.
 | Slug ID              | `slugId`                      | richText |
 | Linear Initiative ID | `id`                          | richText |
 
-Each initiative page body starts with its latest update narrative and then
-lists the projects contributing directly or through sub-initiatives, followed
-by the Initiative overview. **Project Count** is exact for projects visible to
-the API key and includes inherited and archived projects. The body renders up
-to 100 alphabetized project links and directs readers to Linear when more
-exist. Archived projects are annotated, while trashed projects are excluded.
+Each initiative page body starts with its latest update, then lists
+contributing projects (including inherited and archived), then the
+overview. **Project Count** is exact for projects visible to the API
+key. The body renders up to 100 alphabetized project links and points
+at Linear when more exist.
 
-**Linear Initiative ID**, the immutable UUID, is the primary key, while
-**Slug ID** is retained as the readable identifier.
+**Linear Initiative ID** is the primary key.
 
-Latest-update and overview source-text excerpts are each limited to 20,000
-characters. When text is shortened, the page shows an explicit link to its
-complete version in Linear rather than truncating silently.
+Initiatives fail visibly if the Linear plan or the authenticated user
+cannot read them, rather than replacing the database with an empty
+snapshot.
 
-Initiatives are also subject to the authenticated user's Linear plan and
-permissions. If the API reports that the feature is unavailable, the
-initiative sync fails visibly instead of silently replacing the database with
-an empty snapshot. Initiatives must be enabled, and a guest user's key may not
-be able to read them.
+#### Linear Issues
+
+| Notion property    | Linear field                                | Type        |
+| ------------------ | ------------------------------------------- | ----------- |
+| Title              | `title`                                     | title       |
+| Issue Key          | `identifier` (e.g. `ENG-321`)               | richText    |
+| Status             | workspace-specific `state.name`             | select      |
+| Priority           | `priorityLabel` or `priority`               | select      |
+| Assignee           | `assignee.displayName` or `name`            | richText    |
+| Issue Link         | `url`                                       | url         |
+| Updated            | `updatedAt`                                 | date        |
+| Workflow Category  | canonical category from `state.type`        | select      |
+| Team               | `team.name` (or `key`)                      | select      |
+| Project            | `project.id`                                | relation    |
+| Cycle              | `cycle.name`, falling back to `Cycle {n}`   | richText    |
+| Labels             | `labels.nodes[].name`                       | richText    |
+| Release            | `releases` version or name (e.g. `10.4.7`)  | richText    |
+| Release stage      | workspace-custom `stage.name`               | select      |
+| Released at        | `release.completedAt`                       | date        |
+| Release pipeline   | `release.pipeline.name`                     | richText    |
+| Estimate           | `estimate`                                  | number      |
+| Due Date           | `dueDate`                                   | date        |
+| Started            | `startedAt`                                 | date        |
+| Completed          | `completedAt`                               | date        |
+| Canceled           | `canceledAt`                                | date        |
+| Created            | `createdAt`                                 | date        |
+| Archived           | whether `archivedAt` is set                 | checkbox    |
+| Linear Issue ID    | `id`                                        | richText    |
+
+The page body is the issue description, truncated at the same 20,000
+characters as project and initiative bodies.
+
+**Linear Issue ID**, the immutable UUID, is the primary key.
+
+**Project is a relation**, one-way, into the Linear Projects database,
+keyed on the Linear project UUID. It is not a select: there are ~1,100
+projects and the set turns over weekly, so a baked option list would
+silently drop new ones. One-way keeps an `Issues` property off the
+projects schema, where it would fan out to thousands of back-references
+per project.
+
+**Cycle is rich text**, not a select, for the same reason Milestones are.
+Cycles are per team and numbered, new ones appear every fortnight
+forever, and `Cycle 46` means a different fortnight on every team.
+
+**Labels are rich text too**, rendered as `bug · api · Tier 1`. The
+workspace has roughly a thousand distinct label names and mints new ones
+by the hour — 17 appeared during one half-hour window while this was
+built, which is what an agent-driven triage workflow looks like from
+here. A declared option list would be stale the moment it deployed and
+would silently drop every label created since. Rich text is always
+complete and needs no redeploy; filter with a `contains` text filter,
+keeping in mind that `Low` also matches `Below`.
+
+Label groups were considered as a stable low-cardinality facet and
+rejected: 845 of 1,784 labels have no parent group, and there are still
+82 distinct groups.
+
+**Workflow Category is generated**, not hardcoded. `WorkflowState.type`
+is an open string in Linear's schema rather than an enum. A hardcoded
+list of six categories missed `duplicate`, so every duplicate-closed
+issue lost its category.
+
+If an issue is on more than one release, the worker prefers an open
+(planned/started) release, otherwise the most recently completed one.
+
+`Status`, `Team`, `Workflow Category`, and `Release stage` come from
+`src/options.ts`.
+
+### Generated select options
+
+Notion sync schemas declare select and multi-select options up front, and
+a value Linear returns that is not declared is dropped on write with no
+error. `src/options.ts` holds every workspace-defined option list:
+
+| Constant                    | Source (Linear root connection) | Used by                                   |
+| --------------------------- | ------------------------------- | ----------------------------------------- |
+| `PROJECT_STATUS_OPTIONS`    | `projectStatuses`               | projects `Status`                         |
+| `PROJECT_LABEL_OPTIONS`     | `projectLabels`                 | projects `Labels`                         |
+| `TEAM_OPTIONS`              | `teams`                         | projects `Teams`, issues `Team`           |
+| `ISSUE_STATUS_OPTIONS`      | `workflowStates`                | issues `Status`                           |
+| `WORKFLOW_CATEGORY_OPTIONS` | `workflowStates[].type`         | issues `Workflow Category`                |
+| `RELEASE_STAGE_OPTIONS`     | `releaseStages` plus a seed     | issues `Release stage`                    |
+
+Issue labels are deliberately not in that table — they are rich text on
+the Issues database, so nothing about them has to be declared or kept
+current.
+
+Regenerate and redeploy whenever those change in Linear:
+
+```sh
+LINEAR_API_KEY=lin_api_... npm run options
+ntn workers deploy
+```
+
+`npm run options:check` fetches live, diffs against the committed file,
+and exits non-zero on drift. Run it on a schedule: issue labels and
+workflow states churn weekly, and nothing in the worker can self-heal a
+stale schema.
+
+Options come from Linear's **root connections**, not by walking resource
+pages. Walking projects — the original approach — found 66 of 79 teams,
+9 of 12 project statuses, and 73 of 95 project labels, because it only
+ever saw values attached to a project. Walking tens of thousands of
+issues to learn an option set is not viable at all.
+
+`TEAM_OPTIONS` is the one list generated from both directions. Deleting a
+team in Linear does not clear it from the projects that referenced it:
+five names live projects still carry (`Anton`, `Security Confidential`,
+three `[OLD] …` teams) are absent from the root `teams` connection.
+Generating from the root connection alone would drop them from the
+projects database, so the generator unions in a project walk.
+
+The lists that remain all churn slowly — project statuses, project
+labels, teams, and workflow states change when someone reconfigures a
+team, not continuously. Issue labels were the one fast-moving list, and
+they are rich text precisely so this mechanism does not have to keep up
+with them.
+
+Notion's documented 100-option limit caps a multi-select *value* in one
+request, not how many options a property may declare, and no issue
+carries 100 labels. The schema payload is roughly 50 KB against a 500 KB
+request limit. Still, ~994 declared options is well past anything this
+has been tested at: watch the first `ntn workers deploy` after a
+regeneration. If Notion rejects the Labels schema, the fallback is rich
+text, the same way Cycle and Milestones are handled.
+
+The generator imports `teamSelectNames`, `labelSelectNames`,
+`selectName`, and `workflowCategoryLabel` from `src/helpers.ts`, the same
+functions the transforms use. That is deliberate: whatever normalizes a
+name for the schema has to be the thing that normalizes it for the write,
+or the value is dropped. Commas are the usual culprit —
+`Builder.multiSelect("A", "B")` serializes to `"A,B"`, so an option name
+containing a comma cannot round-trip.
 
 ### Project structure
 
 ```text
 src/
-├── index.ts       — registers three managed databases and four syncs
-├── linear.ts      — GraphQL client, cursor pagination, and rate-limit handling
+├── index.ts       — registers databases and syncs
+├── linear.ts      — GraphQL client, cursor pagination, rate-limit handling
 ├── sync-state.ts  — serializable cursor and incremental-window transitions
+├── options.ts     — generated select and multi-select option lists
 ├── projects.ts    — project schema and transform
 ├── issues.ts      — issue schema and transform
 ├── initiatives.ts — initiative schema and transform
 └── helpers.ts     — shared labels, people, dates, and content helpers
+scripts/
+└── generate-options.mts — rewrite src/options.ts from live Linear
 ```
 
 ### How it works
 
-1. **Projects** use a cursor-paginated replacement sweep every 15 minutes,
-   ordered by stable `createdAt` rather than a value that changes mid-sweep.
-2. **Issues** use an `updatedAt` filter and cursor every 5 minutes. Each run
-   pins an upper time boundary for every page, leaves a short consistency
-   buffer for Linear's indexes, and overlaps the previous watermark. Replaying
-   a small interval is safe because upserts are keyed by UUID; the overlap
-   protects against equal timestamps, indexing lag, and writes at a page
-   boundary.
-3. **Issue reconciliation** performs a complete daily replacement sweep in
-   stable `createdAt` order. The replacement run compares the complete key set
-   and removes hard-deleted issues that incremental polling cannot discover.
-4. **Initiatives** use a cursor-paginated replacement sweep every hour in
-   stable `createdAt` order. Their rows intentionally refresh each sweep
-   because contributing-project membership is derived data without a safe
-   monotonic timestamp for removals.
-5. All top-level collections use Linear's Relay-style GraphQL pagination with
-   `after`, `pageInfo.hasNextPage`, and `pageInfo.endCursor`. Projects and
-   Issues request 50 records per page; Initiatives request 20 to leave
-   headroom in Linear's query-complexity budget for their nested project
-   summaries. The client rejects a missing cursor, and persisted cursor
-   history detects both immediate repeats and longer cursor cycles instead of
-   looping forever.
-6. Issue labels are a nested connection. The first 50 arrive with the issue;
-   only issues with more labels make follow-up GraphQL requests. Those pages
-   share the same pacing and cursor safeguards, and duplicate label names are
-   removed. A top-level issue page may make at most 20 label follow-up requests;
-   exceeding the bound fails the page instead of committing truncated labels.
-7. Initiative projects are also independently cursor-paginated, including
-   projects inherited through sub-initiatives. Their shared 20-request bound
-   fails the Initiative page instead of returning a false count or incomplete
-   project list.
+1. **Project delta (hourly).** Filter Linear `projects` on `updatedAt`
+   between `since` and `until`, ordered by `updatedAt`. The window is
+   pinned for every page of the cycle. After the last page, persist
+   `since = until − 60s`. Trashed projects emit deletes; everything else
+   upserts.
+2. **Project reconciliation (daily).** Cursor-paginated replacement in
+   stable `createdAt` order, no `updatedAt` filter. Replace mode compares
+   the complete key set and removes rows Linear no longer returns.
+3. **Issue delta (daily).** Identical shape to the project delta. The first
+   cycle starts at the epoch and therefore populates the database.
+4. **Issue backfill (manual).** Same replacement shape as project
+   reconciliation, triggered by hand.
+5. **Release freshness (hourly).** Filter Linear `releases` on `updatedAt`
+   and re-upsert the issues attached to those releases. The first cycle
+   looks back seven days. This exists because moving a release from
+   Planned to Released may not bump `issue.updatedAt`.
+6. **Initiatives (daily).** Same replacement shape as project
+   reconciliation. Rows refresh each sweep because contributing-project
+   membership is derived data without a safe monotonic timestamp for
+   removals.
+7. Pagination uses Linear's Relay connections (`after`,
+   `pageInfo.hasNextPage`, `pageInfo.endCursor`). Projects request 20
+   records per page; nested teams/labels/links request 10; nested
+   milestones request 10 and are then paginated to completion; nested
+   initiatives request 5. Issues request 100, with nested labels
+   at 20 and nested releases at 10. Releases request 20, with nested
+   issue ids at 50 then paginated to completion. The project limits exist to stay under Linear's per-request
+   complexity cap (~10,000); the issue page size is about payload and
+   batch size, not complexity (see below). The client rejects a missing cursor, and persisted
+   cursor history detects repeats and longer cycles.
+8. Cursor history is capped at the 50 most recent cursors, because an
+   issue cycle runs into the thousands of pages and every cursor is
+   persisted between executions. A page counter (20,000) is the backstop
+   for a loop that outlives the retained window.
+9. Initiative projects are independently cursor-paginated, including
+   projects inherited through sub-initiatives. A shared 20-request bound
+   fails the initiative page instead of returning a false count.
+10. Project milestones are independently cursor-paginated the same way, so
+   projects with more than 10 milestones keep their trailing EA/GA
+   entries. A shared 40-request bound covers a follow-up for every project
+   on a page and fails the page instead of writing a truncated list.
+   `PROJECT_MILESTONE_PAGE_SIZE` stays at 10 so the base projects query's
+   complexity is unchanged; raising it trades follow-up requests for
+   complexity and needs an `x-complexity` measurement first.
 
-All list queries pass `includeArchived: true`. Archived resources therefore
-remain available for history and are marked with the **Archived** checkbox.
-If Linear returns a recently deleted issue with `trashed: true`, the
-incremental sync emits an explicit delete. Linear does not document
-`includeArchived` as including trash, so prompt soft-delete delivery is not
-assumed. Replacement syncs exclude any trashed records they do receive, and
-the daily issue reconciliation is the guaranteed repair path once a deleted
-issue no longer appears in the full collection.
+All list queries pass `includeArchived: true`. Archived resources stay
+available for history and are marked with the **Archived** checkbox.
 
-#### Suggested Notion views
+### Suggested Notion views
 
-- **Active projects:** filter Archived off and Status Category to Backlog,
-  Planned, Started, or Paused; sort by Health and Target Date.
-- **Team issue tracker:** filter Archived off, then group by Team and Workflow
-  Category. Add a Cycle filter for a current-cycle view.
-- **Unassigned work:** filter Assignee empty and Workflow Category not Completed
-  or Canceled; sort by Priority.
-- **Leadership initiatives:** filter Archived off, group by Health, and sort by
-  Target Date. Use Project Count to find strategic goals with no associated
-  projects visible to the API key.
-- **History:** filter Archived on in any database rather than mixing historical
-  records into its default active view.
+- **Active projects:** filter Archived off and Status Category to
+  Backlog, Planned, Started, or Paused; sort by Health and Target Date.
+- **Team board:** filter Issues on Team and Workflow Category (Started,
+  Unstarted), group by Status, sort by Priority. Labels are rich text,
+  so narrow by label with a `contains` filter.
+- **Project rollup:** group Issues by the Project relation to see
+  everything in flight under a project alongside its Projects row.
+- **Leadership initiatives:** filter Archived off, group by Health, and
+  sort by Target Date. Use Project Count to find strategic goals with no
+  associated projects.
+- **History:** filter Archived on rather than mixing historical records
+  into the default active view.
 
-#### Rate limits and query complexity
+### Rate limits and query complexity
 
-Every GraphQL request from all four syncs, including follow-up label and
-Initiative-project pages, shares one pacer set to **2,000 requests per hour**.
-Linear's current API-key request-limit table lists 2,500 requests per
-authenticated user per hour, so the pacer leaves meaningful headroom for
-incidental traffic. Multiple keys belonging to the same user share that quota.
+Every GraphQL request from every live sync shares one pacer set to
+**2,000 requests per hour**. Linear documents 2,500 requests per
+authenticated user per hour; the pacer leaves headroom. Multiple keys
+belonging to the same user share that quota.
 
-Linear also applies a separate hourly query-complexity budget and rejects an
-individual query above its maximum complexity. The example requests only the
-fields it maps, uses explicit 20- or 50-record connection limits, and paginates
-nested labels and Initiative projects separately. This keeps connection
-multiplication predictable instead of hiding a large nested query in one
-request.
+That budget is apportioned across every sync using the pacer, so adding
+a sync dilutes the ones already there. A declared-but-idle manual sync
+may still hold a share; if `projectsSync` throughput drops after a
+deploy, `ntn workers capabilities disable issuesBackfill` between runs is
+the mitigation.
 
-The client treats both HTTP 429 responses and GraphQL `RATELIMITED` errors as
-rate limits. It reads `Retry-After` and Linear's request, endpoint, and
-complexity reset headers, then passes the longest applicable delay to the
-Workers runtime. It also rejects GraphQL partial responses so missing fields
-cannot silently become incomplete Notion pages.
+Linear also applies a separate hourly query-complexity budget (3,000,000
+points) and rejects an individual query above 10,000 points. Measured on
+this workspace, the issues query costs **16 points** (`x-complexity`) at
+page sizes of 50, 100, and 250 alike, so complexity is not what bounds
+it — the **request budget binds first**.
+
+`ISSUE_PAGE_SIZE` is therefore set by payload and batch size, not
+complexity: 100 issues is a ~280 KB response and a change batch the
+Workers runtime is comfortable with, where 250 measured at ~584 KB. The
+projects query is a different story — its nested connections are why
+`PROJECT_PAGE_SIZE` is 20 — so do not raise that one without measuring.
+Read `x-complexity` off any response to get the real number.
+
+Issues and initiatives no longer share a page-size constant.
+`ISSUE_PAGE_SIZE` and `ISSUE_LABEL_PAGE_SIZE` are separate from
+`INITIATIVE_PAGE_SIZE` and `INITIATIVE_NESTED_PAGE_SIZE`, because one
+shared `PAGE_SIZE` meant that tuning issues silently retuned initiatives.
+Nested labels dominate the per-request issue complexity, so shrink the
+label page before shrinking the outer page.
+
+The client treats HTTP 429 and GraphQL `RATELIMITED` as rate limits,
+reads `Retry-After` and Linear's reset headers, and passes the longest
+delay to the Workers runtime. Partial GraphQL responses are rejected so
+missing fields cannot become incomplete Notion pages.
 
 ### Linear access and credentials
 
@@ -286,57 +512,70 @@ The key's Linear visibility defines what the worker can copy.
 3. Store it as `LINEAR_API_KEY`; Linear only shows the secret when it is
    created.
 
-The worker sends this value directly in Linear's `Authorization` header, as
-required for personal API keys. Do not add a `Bearer` prefix. You do not need
-to build authentication headers or provide a `NOTION_API_TOKEN`; the worker
-handles Linear authorization and the Workers platform handles Notion
-credentials.
+The worker sends this value directly in Linear's `Authorization` header.
+Do not add a `Bearer` prefix. You do not need to provide a
+`NOTION_API_TOKEN` for Workers CLI commands; that env var overrides
+`ntn login` and will break `ntn workers *`.
 
 ### Configuration reference
-
-#### Required
 
 | Variable         | Description                                                |
 | ---------------- | ---------------------------------------------------------- |
 | `LINEAR_API_KEY` | Personal API key with access to the resources being synced |
 
-For local execution, copy `.env.example` to `.env` and add your key. `.env` is
-gitignored and must not be committed.
+For local execution, copy `.env.example` to `.env` and add your key.
+`.env` is gitignored.
 
 ### Local verification
-
-Run all offline tests without a Linear connection:
 
 ```sh
 npm test
 ```
 
-Run a sync locally against the Linear workspace accessible to the key in your
-`.env` file:
+Run a sync locally against the Linear workspace accessible to the key in
+`.env`:
 
 ```sh
 ntn workers exec projectsSync --local
+ntn workers exec projectsReconciliationSync --local
 ntn workers exec issuesSync --local
-ntn workers exec issuesReconciliationSync --local
+ntn workers exec releasesSync --local
 ntn workers exec initiativesSync --local
 ```
 
-Use `--preview` when triggering a deployed sync whose returned fields you want
-to inspect before writing to Notion.
+Use `--preview` when triggering a deployed sync whose returned fields you
+want to inspect before writing to Notion.
 
 ### Operational notes
 
-Linear recommends webhooks instead of polling for production integrations that
-can receive events. Workers syncs currently use scheduled execution, so this
-example combines a five-minute incremental poll with daily reconciliation. A
-webhook-capable deployment can retain the reconciliation sweep as a repair path.
+Linear recommends webhooks instead of polling for production
+integrations that can receive events. Workers syncs currently use
+scheduled execution, so this worker polls incrementally and keeps
+replacement sweeps as a repair path. A webhook-capable deployment can
+keep the same split.
 
-Linear-hosted images embedded in Markdown may require Linear authentication;
-Notion readers who are not signed into Linear may not be able to render them.
+**First run after deploying issues:**
+
+1. `ntn workers deploy`.
+2. `ntn workers sync trigger issuesSync`. The first cycle chains from the
+   epoch through every issue in the workspace and runs for hours. Watch
+   `ntn workers sync status`; it is done when the watermark leaves the
+   epoch.
+3. After that the daily schedule fetches only changes since the preceding
+   watermark.
+
+If the first cycle stalls, the levers are a larger `ISSUE_PAGE_SIZE`,
+the description truncation in `issuePageContent`, and the bounded cursor
+state in `src/sync-state.ts`.
+
+Linear-hosted images embedded in Markdown may require Linear
+authentication; Notion readers who are not signed into Linear may not
+be able to render them.
+
+Worker-managed databases are owned by the worker. They cannot currently
+write into a pre-existing Notion database.
 
 ### Adapting the schema
-
-Each resource file contains both its managed-database schema and transform:
 
 | Resource    | File                 |
 | ----------- | -------------------- |
@@ -344,18 +583,22 @@ Each resource file contains both its managed-database schema and transform:
 | Issues      | `src/issues.ts`      |
 | Initiatives | `src/initiatives.ts` |
 
+Adding a property to an existing database does not backfill rows the
+delta has not touched. Run the matching replacement sweep afterwards
+(`issuesBackfill` for issues).
+
 To add a Linear field:
 
 1. Add it to the resource's GraphQL selection and TypeScript type in
    `src/linear.ts`.
-2. Add a property with the appropriate `Schema.*` type in the resource file.
-3. Add the matching `Builder.*` value in the resource transform, preserving
-   schema order.
+2. Add a property with the appropriate `Schema.*` type in the resource
+   file. Select and multi-select properties need a non-empty option
+   list (`scripts/generate-options.mts` for workspace-defined values).
+3. Add the matching `Builder.*` value in the resource transform,
+   preserving schema order.
 4. Add standard, minimal, and relevant edge-case assertions to `test.ts`.
 
-Keep the immutable UUID property as each database's primary key. Add related
-resources as resolved names unless you intentionally design and validate a
-cross-database relation lifecycle.
+Keep the immutable UUID property as each database's primary key.
 
 ## Learn more
 
@@ -368,4 +611,3 @@ cross-database relation lifecycle.
 - [Linear documentation — Initiatives](https://linear.app/docs/initiatives)
 - [Linear documentation — Initiative and Project updates](https://linear.app/docs/initiative-and-project-updates)
 - [Linear documentation — Sub-initiatives](https://linear.app/docs/sub-initiatives)
-- [Contributing guide](../../CONTRIBUTING.md)

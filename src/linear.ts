@@ -5,12 +5,48 @@
 import { RateLimitError } from "@notionhq/workers"
 
 const API_URL = "https://api.linear.app/graphql"
-const PAGE_SIZE = 50
-// Initiative rows embed the first 50 contributing projects. A smaller outer
-// page keeps the worst-case query comfortably below Linear's complexity cap.
+// Projects nest several connections. Keep both the outer page and nested
+// pages small so a single request stays under Linear's 10k complexity cap.
+const PROJECT_PAGE_SIZE = 20
+const PROJECT_NESTED_PAGE_SIZE = 10
+const PROJECT_INITIATIVE_PAGE_SIZE = 5
+// Milestones are their own constant because they are the one project
+// connection that routinely runs past the nested page size: a release project
+// carries a milestone per dev workstream plus EA/GA. Kept at 10 so the base
+// query's complexity is unchanged, with the follow-up pagination below
+// fetching the rest.
+const PROJECT_MILESTONE_PAGE_SIZE = 10
+// Initiative rows embed contributing projects. A smaller outer page keeps the
+// worst-case query comfortably below Linear's complexity cap.
 const INITIATIVE_PAGE_SIZE = 20
+const INITIATIVE_NESTED_PAGE_SIZE = 50
+// Issues are the highest-volume resource, so the outer page is sized for
+// throughput. Linear reports `x-complexity: 16` for this query at page sizes
+// of 50, 100, and 250 alike, so the 10,000-per-query cap is irrelevant here
+// and the request budget is the only thing that binds. 100 keeps the response
+// near 280 KB and the change batch at the size the Workers runtime expects;
+// 250 was measured at 584 KB, which is a large single execution.
+//
+// These are deliberately separate from the initiative sizes; one shared
+// constant previously meant that tuning issues silently retuned initiatives.
+const ISSUE_PAGE_SIZE = 100
+const ISSUE_LABEL_PAGE_SIZE = 20
+const ISSUE_RELEASE_PAGE_SIZE = 10
+const RELEASE_PAGE_SIZE = 20
+const RELEASE_ISSUE_PAGE_SIZE = 50
+// Per issue *page* budget for label follow-up requests. Only issues carrying
+// more than ISSUE_LABEL_PAGE_SIZE labels consume any of it.
 const MAX_NESTED_LABEL_REQUESTS_PER_PAGE = 20
 export const MAX_NESTED_INITIATIVE_PROJECT_REQUESTS_PER_PAGE = 20
+// Per project *page* budget for milestone follow-up requests. One page holds
+// PROJECT_PAGE_SIZE projects and only those carrying more than
+// PROJECT_MILESTONE_PAGE_SIZE milestones spend any of it, so this leaves room
+// for every project on a page to need a follow-up and still not fail.
+export const MAX_NESTED_MILESTONE_REQUESTS_PER_PAGE = 40
+// Per release *page* budget for issue-id follow-ups. A scheduled mobile
+// train can carry more than RELEASE_ISSUE_PAGE_SIZE issues; this leaves
+// room for every release on a page to need a couple of extra fetches.
+export const MAX_NESTED_RELEASE_ISSUE_REQUESTS_PER_PAGE = 80
 
 export type BeforeRequest = () => Promise<void>
 
@@ -33,6 +69,7 @@ export type LinearPage<T> = {
 export type LinearUser = {
   name: string | null
   displayName: string | null
+  email: string | null
 }
 
 export type LinearStatusUpdate = {
@@ -59,6 +96,21 @@ export type LinearTeam = {
   key: string | null
 }
 
+export type LinearLabel = {
+  name: string
+}
+
+export type LinearMilestone = {
+  name: string | null
+  targetDate: string | null
+}
+
+export type LinearInitiativeRef = {
+  id: string
+  name: string | null
+  archivedAt: string | null
+}
+
 export type LinearProject = {
   id: string
   name: string
@@ -69,6 +121,9 @@ export type LinearProject = {
   lastUpdate: LinearStatusUpdate | null
   lead: LinearUser | null
   teams: LinearConnection<LinearTeam>
+  labels: LinearConnection<LinearLabel>
+  projectMilestones: LinearConnection<LinearMilestone>
+  initiatives: LinearConnection<LinearInitiativeRef>
   externalLinks: LinearConnection<LinearNamedLink>
   documents: LinearConnection<LinearNamedLink>
   priority: number | null
@@ -92,8 +147,27 @@ export type LinearIssueState = {
   type: string
 }
 
-export type LinearLabel = {
-  name: string
+export type LinearReleaseStage = {
+  name: string | null
+  type: string | null
+}
+
+export type LinearReleaseRef = {
+  id: string
+  name: string | null
+  version: string | null
+  completedAt: string | null
+  updatedAt: string
+  archivedAt: string | null
+  trashed: boolean | null
+  stage: LinearReleaseStage | null
+  pipeline: { name: string | null } | null
+}
+
+export type LinearRelease = {
+  id: string
+  updatedAt: string
+  issues: LinearConnection<{ id: string }>
 }
 
 export type LinearIssue = {
@@ -107,9 +181,10 @@ export type LinearIssue = {
   priorityLabel: string
   assignee: LinearUser | null
   team: { name: string; key: string } | null
-  project: { name: string } | null
+  project: { id: string; name: string } | null
   cycle: { name: string; number: number } | null
   labels: LinearConnection<LinearLabel>
+  releases: LinearConnection<LinearReleaseRef>
   estimate: number | null
   dueDate: string | null
   createdAt: string
@@ -152,6 +227,19 @@ export type LinearInitiativeProject = {
 }
 
 export type FetchIssuesOptions = {
+  after?: string
+  updatedSince?: string
+  updatedBefore?: string
+  ids?: string[]
+}
+
+export type FetchReleasesOptions = {
+  after?: string
+  updatedSince?: string
+  updatedBefore?: string
+}
+
+export type FetchProjectsOptions = {
   after?: string
   updatedSince?: string
   updatedBefore?: string
@@ -382,12 +470,17 @@ function connectionToPage<T>(
 }
 
 const PROJECTS_QUERY = /* GraphQL */ `
-  query Projects($after: String) {
+  query Projects(
+    $after: String
+    $filter: ProjectFilter
+    $orderBy: PaginationOrderBy!
+  ) {
     projects(
-      first: ${PAGE_SIZE}
+      first: ${PROJECT_PAGE_SIZE}
       after: $after
-      orderBy: createdAt
+      orderBy: $orderBy
       includeArchived: true
+      filter: $filter
     ) {
       nodes {
         id
@@ -407,25 +500,49 @@ const PROJECTS_QUERY = /* GraphQL */ `
           user {
             name
             displayName
+            email
           }
         }
         lead {
           name
           displayName
+          email
         }
-        teams(first: ${PAGE_SIZE}) {
+        teams(first: ${PROJECT_NESTED_PAGE_SIZE}) {
           nodes {
             name
             key
           }
         }
-        externalLinks(first: ${PAGE_SIZE}) {
+        labels(first: ${PROJECT_NESTED_PAGE_SIZE}) {
+          nodes {
+            name
+          }
+        }
+        projectMilestones(first: ${PROJECT_MILESTONE_PAGE_SIZE}) {
+          nodes {
+            name
+            targetDate
+          }
+          pageInfo {
+            hasNextPage
+            endCursor
+          }
+        }
+        initiatives(first: ${PROJECT_INITIATIVE_PAGE_SIZE}) {
+          nodes {
+            id
+            name
+            archivedAt
+          }
+        }
+        externalLinks(first: ${PROJECT_NESTED_PAGE_SIZE}) {
           nodes {
             url
             label
           }
         }
-        documents(first: ${PAGE_SIZE}) {
+        documents(first: ${PROJECT_NESTED_PAGE_SIZE}) {
           nodes {
             title
             url
@@ -454,15 +571,147 @@ const PROJECTS_QUERY = /* GraphQL */ `
   }
 `
 
+const PROJECT_MILESTONES_QUERY = /* GraphQL */ `
+  query ProjectMilestones($projectId: String!, $after: String!) {
+    project(id: $projectId) {
+      projectMilestones(first: ${PROJECT_MILESTONE_PAGE_SIZE}, after: $after) {
+        nodes {
+          name
+          targetDate
+        }
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
+      }
+    }
+  }
+`
+
+function assertMilestonesConnection(
+  milestones: LinearConnection<LinearMilestone>,
+  projectId: string
+): void {
+  if (!milestones || !Array.isArray(milestones.nodes) || !milestones.pageInfo) {
+    throw new Error(
+      `Linear project ${projectId} has an invalid projectMilestones connection`
+    )
+  }
+  if (typeof milestones.pageInfo.hasNextPage !== "boolean") {
+    throw new Error(
+      `Linear project ${projectId} projectMilestones response is missing hasNextPage`
+    )
+  }
+  if (milestones.pageInfo.hasNextPage && !milestones.pageInfo.endCursor) {
+    throw new Error(
+      `Linear project ${projectId} projectMilestones pagination is missing endCursor`
+    )
+  }
+}
+
+/**
+ * Milestones drive downstream EA/GA automations, so a partial list is worse
+ * than a failed page: a missing milestone is indistinguishable from one that
+ * was never defined. Walk the connection to the end and fail loudly if the
+ * budget runs out.
+ */
+async function fetchAllProjectMilestones(
+  project: LinearProject,
+  beforeRequest: BeforeRequest,
+  requestBudget: { remaining: number }
+): Promise<LinearProject> {
+  assertMilestonesConnection(project.projectMilestones, project.id)
+  if (!project.projectMilestones.pageInfo.hasNextPage) return project
+
+  const milestones = [...project.projectMilestones.nodes]
+  const seenCursors = new Set<string>()
+  let pageInfo = project.projectMilestones.pageInfo
+
+  while (pageInfo.hasNextPage) {
+    if (requestBudget.remaining <= 0) {
+      throw new Error(
+        `Linear project milestones exceeded ${MAX_NESTED_MILESTONE_REQUESTS_PER_PAGE} follow-up requests for one project page`
+      )
+    }
+
+    const after = pageInfo.endCursor
+    if (!after) {
+      throw new Error(
+        `Linear project ${project.id} projectMilestones pagination is missing endCursor`
+      )
+    }
+    if (seenCursors.has(after)) {
+      throw new Error(
+        `Linear project ${project.id} projectMilestones pagination repeated cursor`
+      )
+    }
+    seenCursors.add(after)
+    requestBudget.remaining -= 1
+
+    const data = await graphql<{
+      project: { projectMilestones: LinearConnection<LinearMilestone> } | null
+    }>(
+      PROJECT_MILESTONES_QUERY,
+      { projectId: project.id, after },
+      beforeRequest
+    )
+    if (!data.project) {
+      throw new Error(
+        `Linear project ${project.id} disappeared while paginating milestones`
+      )
+    }
+
+    assertMilestonesConnection(data.project.projectMilestones, project.id)
+    milestones.push(...data.project.projectMilestones.nodes)
+    pageInfo = data.project.projectMilestones.pageInfo
+  }
+
+  return {
+    ...project,
+    projectMilestones: { nodes: milestones, pageInfo },
+  }
+}
+
 export async function fetchProjectsPage(
   beforeRequest: BeforeRequest,
-  after?: string
+  options: FetchProjectsOptions = {}
 ): Promise<LinearPage<LinearProject>> {
+  const hasUpdatedAtFilter =
+    options.updatedSince !== undefined || options.updatedBefore !== undefined
+  const variables: Record<string, unknown> = {
+    // Replacement sweeps use stable creation order; bounded incremental
+    // windows must use updated order so cursor traversal matches the filter.
+    orderBy: hasUpdatedAtFilter ? "updatedAt" : "createdAt",
+  }
+  if (options.after) variables.after = options.after
+
+  const updatedAt: { gte?: string; lt?: string } = {}
+  if (options.updatedSince !== undefined) updatedAt.gte = options.updatedSince
+  if (options.updatedBefore !== undefined) updatedAt.lt = options.updatedBefore
+  if (Object.keys(updatedAt).length > 0) {
+    variables.filter = { updatedAt }
+  }
+
   const data = await graphql<{
     projects: LinearConnection<LinearProject>
-  }>(PROJECTS_QUERY, after ? { after } : {}, beforeRequest)
+  }>(PROJECTS_QUERY, variables, beforeRequest)
+  const page = connectionToPage(data.projects, options.after, "projects")
 
-  return connectionToPage(data.projects, after, "projects")
+  const resources: LinearProject[] = []
+  const nestedRequestBudget = {
+    remaining: MAX_NESTED_MILESTONE_REQUESTS_PER_PAGE,
+  }
+  for (const project of page.resources) {
+    resources.push(
+      await fetchAllProjectMilestones(
+        project,
+        beforeRequest,
+        nestedRequestBudget
+      )
+    )
+  }
+
+  return { ...page, resources }
 }
 
 const ISSUES_QUERY = /* GraphQL */ `
@@ -472,7 +721,7 @@ const ISSUES_QUERY = /* GraphQL */ `
     $orderBy: PaginationOrderBy!
   ) {
     issues(
-      first: ${PAGE_SIZE}
+      first: ${ISSUE_PAGE_SIZE}
       after: $after
       orderBy: $orderBy
       includeArchived: true
@@ -493,25 +742,45 @@ const ISSUES_QUERY = /* GraphQL */ `
         assignee {
           name
           displayName
+          email
         }
         team {
           name
           key
         }
         project {
+          id
           name
         }
         cycle {
           name
           number
         }
-        labels(first: ${PAGE_SIZE}, includeArchived: true) {
+        labels(first: ${ISSUE_LABEL_PAGE_SIZE}, includeArchived: true) {
           nodes {
             name
           }
           pageInfo {
             hasNextPage
             endCursor
+          }
+        }
+        releases(first: ${ISSUE_RELEASE_PAGE_SIZE}, orderBy: updatedAt, includeArchived: true) {
+          nodes {
+            id
+            name
+            version
+            completedAt
+            updatedAt
+            archivedAt
+            trashed
+            stage {
+              name
+              type
+            }
+            pipeline {
+              name
+            }
           }
         }
         estimate
@@ -536,7 +805,7 @@ const ISSUE_LABELS_QUERY = /* GraphQL */ `
   query IssueLabels($issueId: String!, $after: String!) {
     issue(id: $issueId) {
       labels(
-        first: ${PAGE_SIZE}
+        first: ${ISSUE_LABEL_PAGE_SIZE}
         after: $after
         includeArchived: true
       ) {
@@ -657,11 +926,18 @@ export async function fetchIssuesPage(
   }
   if (options.after) variables.after = options.after
 
+  const filter: Record<string, unknown> = {}
   const updatedAt: { gte?: string; lt?: string } = {}
   if (options.updatedSince !== undefined) updatedAt.gte = options.updatedSince
   if (options.updatedBefore !== undefined) updatedAt.lt = options.updatedBefore
   if (Object.keys(updatedAt).length > 0) {
-    variables.filter = { updatedAt }
+    filter.updatedAt = updatedAt
+  }
+  if (options.ids && options.ids.length > 0) {
+    filter.id = { in: options.ids }
+  }
+  if (Object.keys(filter).length > 0) {
+    variables.filter = filter
   }
 
   const data = await graphql<{
@@ -670,7 +946,7 @@ export async function fetchIssuesPage(
   const page = connectionToPage(data.issues, options.after, "issues")
 
   // A nested connection only incurs extra API requests when an issue actually
-  // has more than PAGE_SIZE labels. Bound all label follow-ups for this issue
+  // has more than ISSUE_LABEL_PAGE_SIZE labels. Bound all label follow-ups for this issue
   // page so one pathological workspace cannot create an unbounded execution.
   const resources: LinearIssue[] = []
   const nestedRequestBudget = {
@@ -679,6 +955,214 @@ export async function fetchIssuesPage(
   for (const issue of page.resources) {
     resources.push(
       await fetchAllIssueLabels(issue, beforeRequest, nestedRequestBudget)
+    )
+  }
+
+  return { ...page, resources }
+}
+
+export async function fetchIssuesByIds(
+  beforeRequest: BeforeRequest,
+  ids: string[]
+): Promise<LinearIssue[]> {
+  const uniqueIds = [...new Set(ids.map((id) => id.trim()).filter(Boolean))]
+  if (uniqueIds.length === 0) return []
+
+  const issues: LinearIssue[] = []
+  for (let index = 0; index < uniqueIds.length; index += ISSUE_PAGE_SIZE) {
+    const chunk = uniqueIds.slice(index, index + ISSUE_PAGE_SIZE)
+    let after: string | undefined
+    for (;;) {
+      const page = await fetchIssuesPage(beforeRequest, { ids: chunk, after })
+      issues.push(...page.resources)
+      if (!page.hasMore) break
+      after = page.nextCursor
+    }
+  }
+  return issues
+}
+
+const RELEASES_QUERY = /* GraphQL */ `
+  query Releases(
+    $after: String
+    $filter: ReleaseFilter
+    $orderBy: PaginationOrderBy!
+  ) {
+    releases(
+      first: ${RELEASE_PAGE_SIZE}
+      after: $after
+      orderBy: $orderBy
+      includeArchived: true
+      filter: $filter
+    ) {
+      nodes {
+        id
+        updatedAt
+        issues(first: ${RELEASE_ISSUE_PAGE_SIZE}, includeArchived: true) {
+          nodes {
+            id
+          }
+          pageInfo {
+            hasNextPage
+            endCursor
+          }
+        }
+      }
+      pageInfo {
+        hasNextPage
+        endCursor
+      }
+    }
+  }
+`
+
+const RELEASE_ISSUES_QUERY = /* GraphQL */ `
+  query ReleaseIssues($releaseId: String!, $after: String!) {
+    release(id: $releaseId) {
+      issues(
+        first: ${RELEASE_ISSUE_PAGE_SIZE}
+        after: $after
+        includeArchived: true
+      ) {
+        nodes {
+          id
+        }
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
+      }
+    }
+  }
+`
+
+function assertReleaseIssuesConnection(
+  issues: LinearConnection<{ id: string }>,
+  releaseId: string
+): void {
+  if (!issues || !Array.isArray(issues.nodes) || !issues.pageInfo) {
+    throw new Error(
+      `Linear release ${releaseId} has an invalid issues connection`
+    )
+  }
+  if (typeof issues.pageInfo.hasNextPage !== "boolean") {
+    throw new Error(
+      `Linear release ${releaseId} issues response is missing hasNextPage`
+    )
+  }
+  if (issues.pageInfo.hasNextPage && !issues.pageInfo.endCursor) {
+    throw new Error(
+      `Linear release ${releaseId} issues pagination is missing endCursor`
+    )
+  }
+}
+
+function dedupeReleaseIssues(
+  issues: Array<{ id: string }>
+): Array<{ id: string }> {
+  const seen = new Set<string>()
+  return issues.filter((issue) => {
+    const id = issue.id?.trim()
+    if (!id || seen.has(id)) return false
+    seen.add(id)
+    return true
+  })
+}
+
+async function fetchAllReleaseIssues(
+  release: LinearRelease,
+  beforeRequest: BeforeRequest,
+  requestBudget: { remaining: number }
+): Promise<LinearRelease> {
+  assertReleaseIssuesConnection(release.issues, release.id)
+  if (!release.issues.pageInfo.hasNextPage) {
+    return {
+      ...release,
+      issues: {
+        ...release.issues,
+        nodes: dedupeReleaseIssues(release.issues.nodes),
+      },
+    }
+  }
+
+  const issues = [...release.issues.nodes]
+  const seenCursors = new Set<string>()
+  let pageInfo = release.issues.pageInfo
+
+  while (pageInfo.hasNextPage) {
+    if (requestBudget.remaining <= 0) {
+      throw new Error(
+        `Linear release issues exceeded ${MAX_NESTED_RELEASE_ISSUE_REQUESTS_PER_PAGE} follow-up requests for one release page`
+      )
+    }
+
+    const after = pageInfo.endCursor
+    if (!after) {
+      throw new Error(
+        `Linear release ${release.id} issues pagination is missing endCursor`
+      )
+    }
+    if (seenCursors.has(after)) {
+      throw new Error(
+        `Linear release ${release.id} issues pagination repeated cursor`
+      )
+    }
+    seenCursors.add(after)
+    requestBudget.remaining -= 1
+
+    const data = await graphql<{
+      release: { issues: LinearConnection<{ id: string }> } | null
+    }>(RELEASE_ISSUES_QUERY, { releaseId: release.id, after }, beforeRequest)
+    if (!data.release) {
+      throw new Error(
+        `Linear release ${release.id} disappeared while paginating issues`
+      )
+    }
+
+    assertReleaseIssuesConnection(data.release.issues, release.id)
+    issues.push(...data.release.issues.nodes)
+    pageInfo = data.release.issues.pageInfo
+  }
+
+  return {
+    ...release,
+    issues: {
+      nodes: dedupeReleaseIssues(issues),
+      pageInfo,
+    },
+  }
+}
+
+export async function fetchReleasesPage(
+  beforeRequest: BeforeRequest,
+  options: FetchReleasesOptions = {}
+): Promise<LinearPage<LinearRelease>> {
+  const hasUpdatedAtFilter =
+    options.updatedSince !== undefined || options.updatedBefore !== undefined
+  const variables: Record<string, unknown> = {
+    orderBy: hasUpdatedAtFilter ? "updatedAt" : "createdAt",
+  }
+  if (options.after) variables.after = options.after
+
+  const updatedAt: { gte?: string; lt?: string } = {}
+  if (options.updatedSince !== undefined) updatedAt.gte = options.updatedSince
+  if (options.updatedBefore !== undefined) updatedAt.lt = options.updatedBefore
+  if (Object.keys(updatedAt).length > 0) {
+    variables.filter = { updatedAt }
+  }
+
+  const data = await graphql<{
+    releases: LinearConnection<LinearRelease>
+  }>(RELEASES_QUERY, variables, beforeRequest)
+  const page = connectionToPage(data.releases, options.after, "releases")
+
+  const resources: LinearRelease[] = []
+  const nestedRequestBudget = {
+    remaining: MAX_NESTED_RELEASE_ISSUE_REQUESTS_PER_PAGE,
+  }
+  for (const release of page.resources) {
+    resources.push(
+      await fetchAllReleaseIssues(release, beforeRequest, nestedRequestBudget)
     )
   }
 
@@ -708,14 +1192,16 @@ const INITIATIVES_QUERY = /* GraphQL */ `
           user {
             name
             displayName
+            email
           }
         }
         owner {
           name
           displayName
+          email
         }
         projects(
-          first: ${PAGE_SIZE}
+          first: ${INITIATIVE_NESTED_PAGE_SIZE}
           orderBy: createdAt
           includeArchived: true
           includeSubInitiatives: true
@@ -755,7 +1241,7 @@ const INITIATIVE_PROJECTS_QUERY = /* GraphQL */ `
   query InitiativeProjects($initiativeId: String!, $after: String!) {
     initiative(id: $initiativeId) {
       projects(
-        first: ${PAGE_SIZE}
+        first: ${INITIATIVE_NESTED_PAGE_SIZE}
         after: $after
         orderBy: createdAt
         includeArchived: true
