@@ -9,17 +9,29 @@ import type { LinearProject } from "./linear.js"
 import {
   dateOnly,
   dateTime,
+  declaredSelectName,
+  declaredSelectNames,
   healthLabel,
+  labelSelectNames,
   latestTimestamp,
   linkedResourcesFromProject,
-  linkedResourcesPropertyText,
   longFormContent,
-  personDisplay,
+  milestoneSummary,
+  personEmail,
   priorityLabel,
   projectStatusLabel,
+  relatedInitiativeIds,
   resourcePageContent,
   teamSelectNames,
 } from "./helpers.js"
+import {
+  PROJECT_LABEL_OPTIONS,
+  PROJECT_STATUS_OPTIONS,
+  TEAM_OPTIONS,
+} from "./options.js"
+
+const selectOptions = (names: readonly string[]) =>
+  names.map((name) => ({ name }))
 
 export const INITIAL_TITLE = "Linear Projects"
 export const PRIMARY_KEY = "Linear Project ID"
@@ -29,8 +41,9 @@ export const projectSchema: Schema.Schema<typeof PRIMARY_KEY> = {
   properties: {
     Name: Schema.title(),
 
-    // Project status names are workspace-defined.
-    Status: Schema.select([]),
+    // Workspace-defined values must be declared here; regenerate src/options.ts
+    // via scripts/generate-options.mts when Linear adds new ones.
+    Status: Schema.select(selectOptions(PROJECT_STATUS_OPTIONS)),
 
     Health: Schema.select([
       { name: "On Track" },
@@ -38,14 +51,24 @@ export const projectSchema: Schema.Schema<typeof PRIMARY_KEY> = {
       { name: "Off Track" },
     ]),
 
-    Lead: Schema.richText(),
+    Lead: Schema.people(),
 
-    // Team names are workspace-defined; options are created dynamically.
-    Teams: Schema.multiSelect([]),
+    Teams: Schema.multiSelect(selectOptions(TEAM_OPTIONS)),
 
     "Project Link": Schema.url(),
 
-    "Linked Resources": Schema.richText(),
+    "Linked Resources": Schema.file(),
+
+    Summary: Schema.richText(),
+
+    "Related Initiative": Schema.relation("initiatives", {
+      twoWay: true,
+      relatedPropertyName: "Projects",
+    }),
+
+    Labels: Schema.multiSelect(selectOptions(PROJECT_LABEL_OPTIONS)),
+
+    Milestones: Schema.richText(),
 
     "Progress %": Schema.number(),
 
@@ -98,13 +121,25 @@ function progressPercent(progress: number | null | undefined): number | null {
 }
 
 export function projectToChange(project: LinearProject) {
-  const status = project.status?.name?.trim()
+  const status = declaredSelectName(
+    project.status?.name,
+    PROJECT_STATUS_OPTIONS
+  )
   const statusCategory = projectStatusLabel(project.status?.type)
   const health = healthLabel(project.health)
-  const lead = personDisplay(project.lead)
-  const teams = teamSelectNames(project.teams?.nodes)
+  const leadEmail = personEmail(project.lead)
+  const teams = declaredSelectNames(
+    teamSelectNames(project.teams?.nodes),
+    TEAM_OPTIONS
+  )
+  const labels = declaredSelectNames(
+    labelSelectNames(project.labels?.nodes),
+    PROJECT_LABEL_OPTIONS
+  )
+  const milestones = milestoneSummary(project.projectMilestones?.nodes)
+  const initiativeIds = relatedInitiativeIds(project.initiatives?.nodes)
   const linkedResources = linkedResourcesFromProject(project)
-  const linkedResourcesText = linkedResourcesPropertyText(linkedResources)
+  const summary = project.description?.trim()
   const url = project.url?.trim()
   const updated = dateTime(project.updatedAt)
   const lastUpdateAt = dateTime(project.lastUpdate?.updatedAt)
@@ -138,12 +173,26 @@ export function projectToChange(project: LinearProject) {
       Name: Builder.title(project.name),
       ...(status ? { Status: Builder.select(status) } : {}),
       ...(health ? { Health: Builder.select(health) } : {}),
-      ...(lead ? { Lead: Builder.richText(lead) } : {}),
+      ...(leadEmail ? { Lead: Builder.people(leadEmail) } : {}),
       ...(teams.length > 0 ? { Teams: Builder.multiSelect(...teams) } : {}),
       ...(url ? { "Project Link": Builder.url(url) } : {}),
-      ...(linkedResourcesText
-        ? { "Linked Resources": Builder.richText(linkedResourcesText) }
+      ...(linkedResources.length > 0
+        ? {
+            "Linked Resources": linkedResources.flatMap((resource) =>
+              Builder.file(resource.url, resource.label)
+            ),
+          }
         : {}),
+      ...(summary ? { Summary: Builder.richText(summary) } : {}),
+      ...(initiativeIds.length > 0
+        ? {
+            "Related Initiative": initiativeIds.map((id) =>
+              Builder.relation(id)
+            ),
+          }
+        : {}),
+      ...(labels.length > 0 ? { Labels: Builder.multiSelect(...labels) } : {}),
+      ...(milestones ? { Milestones: Builder.richText(milestones) } : {}),
       ...(progress != null ? { "Progress %": Builder.number(progress) } : {}),
       ...(targetDate ? { "Target Date": Builder.date(targetDate) } : {}),
       ...(updated ? { Updated: Builder.dateTime(updated) } : {}),
@@ -167,4 +216,10 @@ export function projectToChange(project: LinearProject) {
       "Linear Project ID": Builder.richText(project.id),
     },
   }
+}
+
+export function projectToSyncChange(project: LinearProject) {
+  return project.trashed
+    ? { type: "delete" as const, key: project.id }
+    : projectToChange(project)
 }

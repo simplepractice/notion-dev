@@ -5,6 +5,8 @@
   "scripts": {
     "build": "tsc",
     "check": "tsc --project tsconfig.test.json",
+    "options": "tsx scripts/generate-options.mts",
+    "options:check": "tsx scripts/generate-options.mts --check",
     "test": "node --import tsx --test test.ts"
   },
   "engines": {

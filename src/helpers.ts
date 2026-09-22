@@ -110,6 +110,63 @@ export function cycleDisplay(
   return cycle?.number == null ? null : `Cycle ${cycle.number}`
 }
 
+const OPEN_RELEASE_STAGE_TYPES = new Set(["planned", "started"])
+
+export type LinearReleaseDisplay = {
+  id?: string | null
+  name?: string | null
+  version?: string | null
+  completedAt?: string | null
+  updatedAt?: string | null
+  archivedAt?: string | null
+  trashed?: boolean | null
+  stage?: { name?: string | null; type?: string | null } | null
+  pipeline?: { name?: string | null } | null
+}
+
+function isVisibleRelease(release: LinearReleaseDisplay): boolean {
+  return !release.trashed && !release.archivedAt
+}
+
+function isOpenRelease(release: LinearReleaseDisplay): boolean {
+  const type = release.stage?.type?.trim()
+  return Boolean(type && OPEN_RELEASE_STAGE_TYPES.has(normalizedKey(type)))
+}
+
+function releaseSortTime(release: LinearReleaseDisplay): number {
+  const completed = Date.parse(release.completedAt ?? "")
+  if (Number.isFinite(completed)) return completed
+  const updated = Date.parse(release.updatedAt ?? "")
+  return Number.isFinite(updated) ? updated : 0
+}
+
+/**
+ * An issue can sit on more than one release (iOS + Android, or a leftover
+ * planned row after a ship). Prefer an open (planned/started) release; if
+ * none remain, take the most recently completed one.
+ */
+export function pickCurrentRelease(
+  releases: LinearReleaseDisplay[] | undefined
+): LinearReleaseDisplay | null {
+  const visible = (releases ?? []).filter(isVisibleRelease)
+  if (visible.length === 0) return null
+
+  const open = visible.filter(isOpenRelease)
+  const pool = open.length > 0 ? open : visible
+  return (
+    [...pool].sort(
+      (left, right) => releaseSortTime(right) - releaseSortTime(left)
+    )[0] ?? null
+  )
+}
+
+/** Prefer the version string the Linear UI shows (10.4.7) over the name. */
+export function releaseDisplayName(
+  release: LinearReleaseDisplay | null | undefined
+): string | null {
+  return release?.version?.trim() || release?.name?.trim() || null
+}
+
 /** Prefer Linear's richer document content and fall back to its description. */
 export function longFormContent(
   content: unknown,
@@ -170,16 +227,72 @@ export function personDisplay(
   )
 }
 
-/** Notion multi-select option names cannot contain commas. */
+/** Notion people properties resolve workspace members by email. */
+export function personEmail(
+  person: LinearPersonDisplay | null | undefined
+): string | null {
+  const email = person?.email?.trim()
+  return email && email.includes("@") ? email : null
+}
+
+/**
+ * Normalize a value for a Notion select or multi-select option name. Commas
+ * are not allowed in option names, so they are stripped here and in
+ * scripts/generate-options.mts, which imports this function. Anything that
+ * declares options and anything that emits them must agree, or the value is
+ * silently dropped on write.
+ */
+export function selectName(value: string | null | undefined): string | null {
+  const name = value?.replace(/,/g, "").trim()
+  return name || null
+}
+
+/**
+ * Match Linear's spelling to the canonical option declared in Notion.
+ * Notion treats option names case-insensitively even though Linear permits
+ * separate values such as "In progress" and "In Progress".
+ */
+export function declaredSelectName(
+  value: string | null | undefined,
+  options: readonly string[]
+): string | null {
+  const name = selectName(value)
+  if (!name) return null
+  const folded = name.toLocaleLowerCase()
+  return (
+    options.find((option) => option.toLocaleLowerCase() === folded) ?? name
+  )
+}
+
+export function declaredSelectNames(
+  values: readonly string[],
+  options: readonly string[]
+): string[] {
+  const names: string[] = []
+  const seen = new Set<string>()
+  for (const value of values) {
+    const name = declaredSelectName(value, options)
+    const folded = name?.toLocaleLowerCase()
+    if (!name || !folded || seen.has(folded)) continue
+    seen.add(folded)
+    names.push(name)
+  }
+  return names
+}
+
+export function teamSelectName(
+  team: { name?: string | null; key?: string | null } | null | undefined
+): string | null {
+  return selectName(team?.name) ?? selectName(team?.key)
+}
+
 export function teamSelectNames(
   teams: { name?: string | null; key?: string | null }[] | undefined
 ): string[] {
   const names: string[] = []
   const seen = new Set<string>()
   for (const team of teams ?? []) {
-    const raw = team.name?.trim() || team.key?.trim()
-    if (!raw) continue
-    const name = raw.replace(/,/g, "").trim()
+    const name = teamSelectName(team)
     if (!name || seen.has(name)) continue
     seen.add(name)
     names.push(name)
@@ -218,6 +331,76 @@ export function linkedResourcesFromProject(project: {
 export function linkedResourcesPropertyText(resources: LinkedResource[]): string | null {
   if (resources.length === 0) return null
   return resources.map((resource) => `${resource.label}: ${resource.url}`).join(" · ")
+}
+
+export function labelSelectNames(
+  labels: { name?: string | null }[] | undefined
+): string[] {
+  const names: string[] = []
+  const seen = new Set<string>()
+  for (const label of labels ?? []) {
+    const name = selectName(label.name)
+    if (!name || seen.has(name)) continue
+    seen.add(name)
+    names.push(name)
+  }
+  return names
+}
+
+/**
+ * Issue labels are rendered as rich text rather than multi-select options.
+ * The workspace has roughly a thousand distinct label names and gains new
+ * ones by the hour, so a declared option list would need a redeploy to stay
+ * complete and would silently drop every label created since the last one.
+ * Unlike labelSelectNames, this keeps the name exactly as Linear reports it.
+ */
+export function labelSummary(
+  labels: { name?: string | null }[] | undefined
+): string | null {
+  const names: string[] = []
+  const seen = new Set<string>()
+  for (const label of labels ?? []) {
+    const name = label.name?.trim()
+    if (!name || seen.has(name)) continue
+    seen.add(name)
+    names.push(name)
+  }
+  return names.length > 0 ? names.join(" · ") : null
+}
+
+// Milestone names are per-project freeform text, so they are rendered as a
+// single rich-text summary rather than select options.
+export function milestoneSummary(
+  milestones: { name?: string | null; targetDate?: string | null }[] | undefined
+): string | null {
+  const names: string[] = []
+  const seen = new Set<string>()
+  for (const milestone of milestones ?? []) {
+    const raw = milestone.name?.trim()
+    if (!raw) continue
+    const target = dateOnly(milestone.targetDate)
+    const name = target ? `${raw} (${target})` : raw
+    if (seen.has(name)) continue
+    seen.add(name)
+    names.push(name)
+  }
+  return names.length > 0 ? names.join(" · ") : null
+}
+
+export function relatedInitiativeIds(
+  initiatives:
+    | { id?: string | null; archivedAt?: string | null }[]
+    | undefined
+): string[] {
+  const ids: string[] = []
+  const seen = new Set<string>()
+  for (const initiative of initiatives ?? []) {
+    const id = initiative.id?.trim()
+    if (!id || initiative.archivedAt || seen.has(id)) continue
+    seen.add(id)
+    ids.push(id)
+  }
+  return ids
 }
 
 export type LinearStatusUpdateContent = {
@@ -385,4 +568,38 @@ export function resourcePageContent(options: {
   }
 
   return sections.join("\n\n")
+}
+
+/**
+ * Issues carry only a description, so they skip the section assembly projects
+ * and initiatives need — but they must not skip the length cap. An unbounded
+ * page body is both a Notion write hazard and the backfill's payload risk.
+ *
+ * Linear descriptions come back as arbitrary user-authored markdown, which
+ * routinely contains raw HTML tags, pointy-bracket wrapped URLs alongside
+ * `[label](<url>)` links, unbalanced code fences, and other constructs that
+ * the platform's server-side markdown diff has rejected in the past —
+ * blocking the sync cursor indefinitely once one such issue shows up. We do
+ * not have visibility into which characters the parser rejects, so we treat
+ * every description as untrusted and escape all CommonMark punctuation
+ * before emitting it. The page body renders as plain, unformatted text with
+ * a link back to the original in Linear at the top; that is a deliberate
+ * tradeoff against silent multi-day sync stalls. Do not relax this without
+ * a full parity test against production descriptions.
+ */
+export function issuePageContent(
+  description: string | null | undefined,
+  issueUrl: string | null | undefined
+): string {
+  const raw = description?.trim() ?? ""
+  if (!raw) return ""
+
+  const truncated = truncateMarkdownSection(raw, issueUrl, "description")
+  // truncateMarkdownSection only escapes when it actually shortens the
+  // content. When the description is short enough to pass through untouched
+  // we escape it here so the parser can never trip on user content.
+  if (truncated === raw) {
+    return escapeMarkdownExcerpt(raw)
+  }
+  return truncated
 }
