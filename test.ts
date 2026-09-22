@@ -971,11 +971,10 @@ test("issue transform emits a full record, dedupes labels, and retains estimate 
     fullIssue.releases.nodes[0]?.updatedAt,
     "a newer release timestamp wins over issue.updatedAt"
   )
-  assert.match(change.pageContentMarkdown, /Acceptance criteria/)
-  assert.match(
-    change.pageContentMarkdown,
-    /Resume from the saved cursor/,
-    "user markdown is escaped, not copied verbatim"
+  assert.equal(
+    "pageContentMarkdown" in change,
+    false,
+    "issue descriptions are not written; they stall the Notion markdown diff"
   )
   assertPropertyContains(change.properties.Title, fullIssue.title)
   assertPropertyContains(change.properties["Issue Key"], "ENG-321")
@@ -1017,7 +1016,7 @@ test("issue transform handles a minimal record and cycle-number fallback", () =>
 
   assert.equal(change.key, minimalIssue.id)
   assert.equal(change.upstreamUpdatedAt, minimalIssue.updatedAt)
-  assert.equal(change.pageContentMarkdown, "")
+  assert.equal("pageContentMarkdown" in change, false)
   assert.equal(change.properties.Status, undefined)
   assert.equal(change.properties["Workflow Category"], undefined)
   assertPropertyContains(change.properties.Priority, "No Priority")
@@ -1146,16 +1145,11 @@ test("case-only Linear statuses map to one Notion option", () => {
   }
 })
 
-test("issue page content is truncated like project page content", () => {
+test("issue transform omits page bodies even when Linear has a long description", () => {
   const description = "d".repeat(MAX_PAGE_SECTION_CHARACTERS + 500)
   const change = issueToChange({ ...fullIssue, description })
 
-  assert.ok(
-    change.pageContentMarkdown.length < description.length,
-    "an unbounded page body is a write hazard and a backfill payload risk"
-  )
-  assert.match(change.pageContentMarkdown, /was shortened in Notion/)
-  assert.match(change.pageContentMarkdown, /Read the full description in Linear/)
+  assert.equal("pageContentMarkdown" in change, false)
 })
 
 test("issue sync changes turn soft-deleted records into immutable-key deletes", () => {

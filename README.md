@@ -276,8 +276,11 @@ snapshot.
 | Archived           | whether `archivedAt` is set                 | checkbox    |
 | Linear Issue ID    | `id`                                        | richText    |
 
-The page body is the issue description, truncated at the same 20,000
-characters as project and initiative bodies.
+Issue rows have **no page body**. Linear descriptions are arbitrary
+markdown and have stalled both `issuesSync` and `issuesBackfill` on
+Notion's markdown diff. Open the issue from **Issue Link**. Existing
+bodies already written are left in place; later upserts do not send
+`pageContentMarkdown`, so Notion does not rewrite them.
 
 **Linear Issue ID**, the immutable UUID, is the primary key.
 
@@ -564,9 +567,9 @@ keep the same split.
 3. After that the daily schedule fetches only changes since the preceding
    watermark.
 
-If the first cycle stalls, the levers are a larger `ISSUE_PAGE_SIZE`,
-the description truncation in `issuePageContent`, and the bounded cursor
-state in `src/sync-state.ts`.
+If the first cycle stalls, the levers are a larger `ISSUE_PAGE_SIZE`
+and the bounded cursor state in `src/sync-state.ts`. Issue descriptions
+are not written as page bodies.
 
 Linear-hosted images embedded in Markdown may require Linear
 authentication; Notion readers who are not signed into Linear may not

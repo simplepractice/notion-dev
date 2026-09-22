@@ -11,7 +11,6 @@ import {
   dateOnly,
   dateTime,
   declaredSelectName,
-  issuePageContent,
   labelSummary,
   latestTimestamp,
   personDisplay,
@@ -162,7 +161,10 @@ export function issueToChange(issue: LinearIssue) {
       issue.updatedAt,
       ...releaseNodes.map((item) => item.updatedAt)
     ),
-    pageContentMarkdown: issuePageContent(issue.description, issue.url),
+    // Do not write issue descriptions as page bodies. Linear markdown
+    // (HTML, autolinks, strikethrough, images) has stalled both the
+    // incremental sync and the backfill on Notion's markdown diff, and
+    // nothing in this database reads the body — Issue Link is the source.
     properties: {
       Title: Builder.title(issue.title),
       ...(identifier ? { "Issue Key": Builder.richText(identifier) } : {}),

@@ -569,37 +569,3 @@ export function resourcePageContent(options: {
 
   return sections.join("\n\n")
 }
-
-/**
- * Issues carry only a description, so they skip the section assembly projects
- * and initiatives need — but they must not skip the length cap. An unbounded
- * page body is both a Notion write hazard and the backfill's payload risk.
- *
- * Linear descriptions come back as arbitrary user-authored markdown, which
- * routinely contains raw HTML tags, pointy-bracket wrapped URLs alongside
- * `[label](<url>)` links, unbalanced code fences, and other constructs that
- * the platform's server-side markdown diff has rejected in the past —
- * blocking the sync cursor indefinitely once one such issue shows up. We do
- * not have visibility into which characters the parser rejects, so we treat
- * every description as untrusted and escape all CommonMark punctuation
- * before emitting it. The page body renders as plain, unformatted text with
- * a link back to the original in Linear at the top; that is a deliberate
- * tradeoff against silent multi-day sync stalls. Do not relax this without
- * a full parity test against production descriptions.
- */
-export function issuePageContent(
-  description: string | null | undefined,
-  issueUrl: string | null | undefined
-): string {
-  const raw = description?.trim() ?? ""
-  if (!raw) return ""
-
-  const truncated = truncateMarkdownSection(raw, issueUrl, "description")
-  // truncateMarkdownSection only escapes when it actually shortens the
-  // content. When the description is short enough to pass through untouched
-  // we escape it here so the parser can never trip on user content.
-  if (truncated === raw) {
-    return escapeMarkdownExcerpt(raw)
-  }
-  return truncated
-}
