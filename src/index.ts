@@ -2,7 +2,7 @@
 // Notion databases for cross-functional product and engineering visibility.
 //
 // Databases:
-//   1. Projects     — strategic delivery view (hourly delta + daily sweep)
+//   1. Projects     — strategic delivery view (daily full sweep)
 //   2. Issues       — engineering work (daily delta + manual backfill + hourly release freshness)
 //   3. Initiatives  — company-level goals and health (daily)
 
@@ -23,7 +23,6 @@ import {
   PRIMARY_KEY as PROJECTS_PK,
   projectSchema,
   projectToChange,
-  projectToSyncChange,
 } from "./projects.js"
 import {
   INITIAL_TITLE as ISSUES_TITLE,
@@ -83,50 +82,11 @@ const projects = worker.database("projects", {
   schema: projectSchema,
 })
 
-// Roughly a dozen of ~1,100 projects change per day, so a full hourly sweep
-// spent ~56 paginated runs per cycle to rewrite unchanged rows. Read only the
-// updatedAt window each hour and let the daily sweep below repair the rest.
+// Project milestone edits do not reliably bump the parent project's updatedAt,
+// so an updatedAt delta can miss exactly the planning changes this database is
+// meant to expose. Projects are small enough (~1,100 rows) for one daily full
+// replacement, which also reconciles hard deletes.
 worker.sync("projectsSync", {
-  database: projects,
-  mode: "incremental",
-  schedule: "1h",
-  execute: async (state: IncrementalSyncState | undefined) => {
-    const { since, until } = incrementalWindow(state)
-
-    const page = await fetchProjectsPage(beforeLinearRequest, {
-      after: state?.after,
-      updatedSince: since,
-      updatedBefore: until,
-    })
-    const changes = page.resources.map(projectToSyncChange)
-
-    if (page.hasMore) {
-      return {
-        changes,
-        hasMore: true,
-        nextState: {
-          since,
-          until,
-          ...nextCursorState(state, page.nextCursor, "projects"),
-        },
-      }
-    }
-
-    // Keep an overlap so equal timestamps, indexing lag, and writes near the
-    // window boundary are safely replayed. Upserts are idempotent by UUID.
-    return {
-      changes,
-      hasMore: false,
-      nextState: { since: nextWatermark(until) },
-    }
-  },
-})
-
-// An updatedAt watermark cannot see hard deletes, and archived projects that
-// fall outside a window would linger, so sweep everything once a day. A
-// ~1,100-row sweep is cheap; the equivalent for issues is not, which is why
-// the issue backfill below is manual.
-worker.sync("projectsReconciliationSync", {
   database: projects,
   mode: "replace",
   schedule: "1d",

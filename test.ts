@@ -63,7 +63,7 @@ import {
   TEAM_OPTIONS,
   WORKFLOW_CATEGORY_OPTIONS,
 } from "./src/options.js"
-import { projectToChange, projectToSyncChange } from "./src/projects.js"
+import { projectToChange } from "./src/projects.js"
 import {
   CONSISTENCY_BUFFER_MS,
   INITIAL_WATERMARK,
@@ -576,12 +576,6 @@ test("worker manifest preserves databases, sync schedules, and shared pacing", (
       {
         key: "projectsSync",
         databaseKey: "projects",
-        mode: "incremental",
-        schedule: { type: "interval", intervalMs: 60 * 60_000 },
-      },
-      {
-        key: "projectsReconciliationSync",
-        databaseKey: "projects",
         mode: "replace",
         schedule: { type: "interval", intervalMs: 24 * 60 * 60_000 },
       },
@@ -866,7 +860,11 @@ test("project transform leads with its latest update and retains the overview", 
     fullProject.id,
     "the immutable Linear UUID is the key"
   )
-  assert.equal(change.upstreamUpdatedAt, fullProject.lastUpdate?.updatedAt)
+  assert.equal(
+    "upstreamUpdatedAt" in change,
+    false,
+    "the full replacement refreshes milestone-only changes"
+  )
   assert.match(change.pageContentMarkdown, /^## Latest update/)
   assert.match(change.pageContentMarkdown, /Updated by Ada · 2026-07-01/)
   assert.match(
@@ -929,7 +927,7 @@ test("project transform leads with its latest update and retains the overview", 
 test("project transform omits absent optional values and keeps zero progress", () => {
   const minimal = projectToChange(minimalProject)
   assert.equal(minimal.key, minimalProject.id)
-  assert.equal(minimal.upstreamUpdatedAt, minimalProject.updatedAt)
+  assert.equal("upstreamUpdatedAt" in minimal, false)
   assert.equal(minimal.pageContentMarkdown, "")
   assert.equal(minimal.properties.Status, undefined)
   assert.equal(minimal.properties["Status Category"], undefined)
@@ -1797,17 +1795,6 @@ test("project requests pin the incremental updatedAt window in GraphQL variables
       },
     },
   })
-})
-
-test("project sync changes turn soft-deleted records into deletes", () => {
-  assert.deepEqual(projectToSyncChange({ ...minimalProject, trashed: true }), {
-    type: "delete",
-    key: minimalProject.id,
-  })
-
-  const upsert = projectToSyncChange(minimalProject)
-  assert.equal(upsert.type, "upsert")
-  assert.equal(upsert.key, minimalProject.id)
 })
 
 test("connection pagination rejects a missing next cursor", async () => {

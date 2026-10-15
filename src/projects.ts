@@ -13,7 +13,6 @@ import {
   declaredSelectNames,
   healthLabel,
   labelSelectNames,
-  latestTimestamp,
   linkedResourcesFromProject,
   longFormContent,
   milestoneSummary,
@@ -153,15 +152,10 @@ export function projectToChange(project: LinearProject) {
   const canceled = dateTime(project.canceledAt)
   const created = dateTime(project.createdAt)
   const slugId = project.slugId?.trim()
-  const upstreamUpdatedAt = latestTimestamp(
-    project.updatedAt,
-    project.lastUpdate?.updatedAt
-  )
 
   return {
     type: "upsert" as const,
     key: project.id,
-    upstreamUpdatedAt,
     pageContentMarkdown: resourcePageContent({
       overview: longFormContent(project.content, project.description),
       overviewHeading: "Project overview",
@@ -216,10 +210,4 @@ export function projectToChange(project: LinearProject) {
       "Linear Project ID": Builder.richText(project.id),
     },
   }
-}
-
-export function projectToSyncChange(project: LinearProject) {
-  return project.trashed
-    ? { type: "delete" as const, key: project.id }
-    : projectToChange(project)
 }

@@ -4,43 +4,29 @@ A Notion Worker that copies Linear projects, issues, and initiatives into
 managed Notion databases for XFN stakeholders. This is a fork of Notion's
 Linear cookbook template, not a self-hosted sync.
 
-## Why projects are incremental
+## Why projects use a nightly replacement
 
-A full hourly replacement of ~1,100 projects was too expensive for how
-little the data actually changes.
+Milestone edits do not reliably bump their parent project's `updatedAt`.
+An incremental project query can therefore miss milestone names and dates
+even when the parent project otherwise looks unchanged.
 
 Linear's per-request complexity cap forced the project GraphQL page size
-down to 20 (from the cookbook's 50). At that size a complete sweep is ~56
-paginated runs. Hourly replacement therefore cost ~1,340 runs/day, almost
-all of it rewriting unchanged rows. Linear showed ~2 project updates in
-an hour and ~13 in a day.
+down to 20 (from the cookbook's 50), so a complete sweep of ~1,100 projects
+is about 56 paginated runs. That is too expensive hourly but reasonable
+once per day. The project sync therefore uses one nightly replacement:
 
-The worker therefore uses the same pattern as the cookbook's issue sync:
+| Sync              | Mode    | Schedule | What it does                                                              |
+| ----------------- | ------- | -------- | ------------------------------------------------------------------------- |
+| `projectsSync`    | replace | Daily    | Full sweep: refresh nested milestone data and remove missing projects     |
+| `issuesSync`      | incremental | Daily | Fetch issues whose `updatedAt` falls in a pinned window                   |
+| `issuesBackfill`  | replace | Manual   | Full issue sweep, run on demand                                           |
+| `releasesSync`    | incremental | Hourly | Refresh issues attached to recently updated Linear releases              |
+| `initiativesSync` | replace | Daily    | Full sweep because contributing-project membership has no reliable clock |
 
-| Sync                           | Mode        | Schedule | What it does                                                                 |
-| ------------------------------ | ----------- | -------- | ---------------------------------------------------------------------------- |
-| `projectsSync`                 | incremental | Hourly   | Fetch only projects whose `updatedAt` falls in a pinned window               |
-| `projectsReconciliationSync`   | replace     | Daily    | Full sweep: repair drift and remove hard deletes the watermark cannot see    |
-| `issuesSync`                   | incremental | Daily    | Same shape, at issue volume. Also does the initial population (see below)    |
-| `issuesBackfill`               | replace     | Manual   | Full sweep, run on demand. A daily sweep at issue volume is not affordable    |
-| `releasesSync`                 | incremental | Hourly   | Walk recently updated Linear releases and rewrite related issue rows         |
-| `initiativesSync`              | replace     | Daily    | Full sweep. Membership of contributing projects has no safe monotonic clock |
-
-The hourly delta pins an upper bound for every page in the cycle, lags
-that bound by a 15-second consistency buffer, and overlaps the previous
-watermark by 60 seconds. Replaying a small interval is safe because
-upserts are keyed by Linear UUID. Soft-deleted (`trashed`) projects
-become explicit deletes on the incremental path. Archiving bumps
-`updatedAt` and rides the hourly delta.
-
-**Trade-off:** a project hard-deleted in Linear can linger in Notion until
-the next daily reconciliation. If a day is too long, lower the
-reconciliation interval; that is cheaper than returning projects to a
-full hourly replace.
-
-After deploy, reset `projectsSync` state before the first incremental
-run. Replace-mode cursors are `createdAt`-ordered and are not valid
-against an `updatedAt` window.
+Project upserts intentionally omit `upstreamUpdatedAt`. Only one sync writes
+project rows, and nested milestone changes do not advance the parent project
+clock. Omitting it ensures every nightly row reflects the complete Linear
+response.
 
 ## Why issues have no scheduled sweep
 
@@ -116,7 +102,6 @@ Populate immediately (bypass the schedule):
 
 ```sh
 ntn workers sync trigger projectsSync
-ntn workers sync trigger projectsReconciliationSync
 ntn workers sync trigger issuesSync
 ntn workers sync trigger releasesSync
 ntn workers sync trigger initiativesSync
@@ -140,12 +125,11 @@ Filter in Notion rather than in the worker.
 
 ### Synced databases and schedules
 
-Three databases are maintained by six syncs:
+Three databases are maintained by five syncs:
 
 | Database               | Sync                         | Mode        | Schedule |
 | ---------------------- | ---------------------------- | ----------- | -------- |
-| **Linear Projects**    | `projectsSync`               | incremental | Hourly   |
-| **Linear Projects**    | `projectsReconciliationSync` | replace     | Daily    |
+| **Linear Projects**    | `projectsSync`               | replace     | Daily    |
 | **Linear Issues**      | `issuesSync`                 | incremental | Daily    |
 | **Linear Issues**      | `issuesBackfill`             | replace     | Manual   |
 | **Linear Issues**      | `releasesSync`               | incremental | Hourly   |
@@ -403,27 +387,23 @@ scripts/
 
 ### How it works
 
-1. **Project delta (hourly).** Filter Linear `projects` on `updatedAt`
-   between `since` and `until`, ordered by `updatedAt`. The window is
-   pinned for every page of the cycle. After the last page, persist
-   `since = until − 60s`. Trashed projects emit deletes; everything else
-   upserts.
-2. **Project reconciliation (daily).** Cursor-paginated replacement in
+1. **Projects (daily).** Cursor-paginated replacement in
    stable `createdAt` order, no `updatedAt` filter. Replace mode compares
-   the complete key set and removes rows Linear no longer returns.
-3. **Issue delta (daily).** Identical shape to the project delta. The first
+   the complete key set and removes rows Linear no longer returns. Because
+   project upserts have no `upstreamUpdatedAt`, milestone-only changes are
+   rewritten even when the parent project's timestamp is unchanged.
+2. **Issue delta (daily).** The first
    cycle starts at the epoch and therefore populates the database.
-4. **Issue backfill (manual).** Same replacement shape as project
-   reconciliation, triggered by hand.
-5. **Release freshness (hourly).** Filter Linear `releases` on `updatedAt`
+3. **Issue backfill (manual).** A full replacement triggered by hand.
+4. **Release freshness (hourly).** Filter Linear `releases` on `updatedAt`
    and re-upsert the issues attached to those releases. The first cycle
    looks back seven days. This exists because moving a release from
    Planned to Released may not bump `issue.updatedAt`.
-6. **Initiatives (daily).** Same replacement shape as project
-   reconciliation. Rows refresh each sweep because contributing-project
+5. **Initiatives (daily).** Full replacement. Rows refresh each sweep
+   because contributing-project
    membership is derived data without a safe monotonic timestamp for
    removals.
-7. Pagination uses Linear's Relay connections (`after`,
+6. Pagination uses Linear's Relay connections (`after`,
    `pageInfo.hasNextPage`, `pageInfo.endCursor`). Projects request 20
    records per page; nested teams/labels/links request 10; nested
    milestones request 10 and are then paginated to completion; nested
@@ -433,14 +413,14 @@ scripts/
    complexity cap (~10,000); the issue page size is about payload and
    batch size, not complexity (see below). The client rejects a missing cursor, and persisted
    cursor history detects repeats and longer cycles.
-8. Cursor history is capped at the 50 most recent cursors, because an
+7. Cursor history is capped at the 50 most recent cursors, because an
    issue cycle runs into the thousands of pages and every cursor is
    persisted between executions. A page counter (20,000) is the backstop
    for a loop that outlives the retained window.
-9. Initiative projects are independently cursor-paginated, including
+8. Initiative projects are independently cursor-paginated, including
    projects inherited through sub-initiatives. A shared 20-request bound
    fails the initiative page instead of returning a false count.
-10. Project milestones are independently cursor-paginated the same way, so
+9. Project milestones are independently cursor-paginated the same way, so
    projects with more than 10 milestones keep their trailing EA/GA
    entries. A shared 40-request bound covers a follow-up for every project
    on a page and fails the page instead of writing a truncated list.
@@ -540,7 +520,6 @@ Run a sync locally against the Linear workspace accessible to the key in
 
 ```sh
 ntn workers exec projectsSync --local
-ntn workers exec projectsReconciliationSync --local
 ntn workers exec issuesSync --local
 ntn workers exec releasesSync --local
 ntn workers exec initiativesSync --local
